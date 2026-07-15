@@ -6,7 +6,7 @@ resources:
 images:
   - name: task-tracking-backend
     newName: 866934333672.dkr.ecr.us-east-1.amazonaws.com/task-tracking-dev-backend
-    newTag: 6259a02887e10d73a51b55a501c9759bec242332
+    newTag: e07e1ddd0fbafeb0a34f95151b38616cf3c4e24a
   - name: task-tracking-frontend
     newName: 866934333672.dkr.ecr.us-east-1.amazonaws.com/task-tracking-dev-frontend
-    newTag: 6259a02887e10d73a51b55a501c9759bec242332
+    newTag: e07e1ddd0fbafeb0a34f95151b38616cf3c4e24a
