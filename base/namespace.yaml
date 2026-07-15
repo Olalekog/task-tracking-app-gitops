@@ -1,0 +1,31 @@
+﻿apiVersion: v1
+kind: Namespace
+metadata:
+  name: frontend
+  labels:
+    app.kubernetes.io/part-of: task-tracking-app
+    app.kubernetes.io/component: frontend
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend
+  labels:
+    app.kubernetes.io/part-of: task-tracking-app
+    app.kubernetes.io/component: backend
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: database
+  labels:
+    app.kubernetes.io/part-of: task-tracking-app
+    app.kubernetes.io/component: database
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+  labels:
+    app.kubernetes.io/part-of: task-tracking-app
+    app.kubernetes.io/component: security

@@ -1,0 +1,48 @@
+﻿apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init
+  namespace: database
+data:
+  001-seed-tasks.sql: |
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INT NOT NULL AUTO_INCREMENT,
+      title VARCHAR(160) NOT NULL,
+      description TEXT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'todo',
+      owner VARCHAR(120) NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      INDEX ix_tasks_id (id)
+    );
+
+    INSERT IGNORE INTO tasks (id, title, description, status, owner, created_at, updated_at)
+    VALUES
+      (
+        1,
+        'Review deployment checklist',
+        'Confirm manifests, secrets, and image tags before the next rollout.',
+        'todo',
+        'Olalekan',
+        UTC_TIMESTAMP(),
+        UTC_TIMESTAMP()
+      ),
+      (
+        2,
+        'Connect frontend to backend API',
+        'Verify task creation and status updates from the React interface.',
+        'in_progress',
+        'Platform Team',
+        UTC_TIMESTAMP(),
+        UTC_TIMESTAMP()
+      ),
+      (
+        3,
+        'Provision UAT infrastructure',
+        'Run Terraform for the UAT environment and capture the generated outputs.',
+        'done',
+        'Cloud Team',
+        UTC_TIMESTAMP(),
+        UTC_TIMESTAMP()
+      );
