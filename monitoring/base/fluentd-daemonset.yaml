@@ -33,19 +33,18 @@ spec:
               value: elasticsearch.monitoring.svc.cluster.local
             - name: FLUENT_ELASTICSEARCH_PORT
               value: "9200"
+            # These nodes run containerd, not Docker, so the journald/systemd
+            # log source (which needs to write a cursor file under the
+            # read-only-for-us /var/log hostPath) must be disabled.
+            - name: FLUENTD_SYSTEMD_CONF
+              value: disable
           volumeMounts:
             - name: varlog
               mountPath: /var/log
-            - name: containers
-              mountPath: /var/lib/docker/containers
-              readOnly: true
       volumes:
         - name: varlog
           hostPath:
             path: /var/log
-        - name: containers
-          hostPath:
-            path: /var/lib/docker/containers
 ---
 apiVersion: v1
 kind: ServiceAccount
