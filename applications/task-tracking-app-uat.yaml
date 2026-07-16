@@ -2,12 +2,15 @@
 kind: Application
 metadata:
   name: task-tracking-app-uat
-  namespace: argocd
+  namespace: argocd-ns
 spec:
   project: default
   source:
     repoURL: https://github.com/Olalekog/task-tracking-app-gitops.git
-    targetRevision: main
+    # TODO: point at the "uat" branch once real overlays/uat content is
+    # promoted there via PR (that branch is currently empty). Using "dev"
+    # for now so this Application can actually sync.
+    targetRevision: dev
     path: overlays/uat
   destination:
     server: https://kubernetes.default.svc

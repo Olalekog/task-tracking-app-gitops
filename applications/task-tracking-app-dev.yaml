@@ -2,12 +2,12 @@
 kind: Application
 metadata:
   name: task-tracking-app-dev
-  namespace: argocd
+  namespace: argocd-ns
 spec:
   project: default
   source:
     repoURL: https://github.com/Olalekog/task-tracking-app-gitops.git
-    targetRevision: main
+    targetRevision: dev
     path: overlays/dev
   destination:
     server: https://kubernetes.default.svc
