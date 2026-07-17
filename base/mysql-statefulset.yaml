@@ -13,6 +13,10 @@ spec:
     metadata:
       labels:
         app: mysql
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9104"
+        prometheus.io/path: "/metrics"
     spec:
       securityContext:
         runAsNonRoot: true
@@ -54,6 +58,32 @@ spec:
             limits:
               cpu: 1
               memory: 1Gi
+        - name: mysqld-exporter
+          image: prom/mysqld-exporter:v0.17.2
+          args:
+            - --mysqld.address=127.0.0.1:3306
+            - --mysqld.username=exporter
+          env:
+            - name: MYSQLD_EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_EXPORTER_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 9104
+              name: metrics
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
       volumes:
         - name: mysql-init
           configMap:

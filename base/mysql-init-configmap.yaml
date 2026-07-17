@@ -4,6 +4,14 @@ metadata:
   name: mysql-init
   namespace: database
 data:
+  000-create-exporter-user.sql: |
+    -- Note: docker-entrypoint-initdb.d scripts only run against a fresh,
+    -- empty data directory. On an already-initialized volume, this user
+    -- must be created manually (or via a migration job) instead.
+    CREATE USER IF NOT EXISTS 'exporter'@'127.0.0.1' IDENTIFIED BY 'change-me-exporter';
+    GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'exporter'@'127.0.0.1';
+    GRANT SELECT ON performance_schema.* TO 'exporter'@'127.0.0.1';
+    FLUSH PRIVILEGES;
   001-seed-tasks.sql: |
     CREATE TABLE IF NOT EXISTS tasks (
       id INT NOT NULL AUTO_INCREMENT,
