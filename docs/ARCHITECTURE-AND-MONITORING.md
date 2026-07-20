@@ -94,14 +94,15 @@ flowchart TB
         Prom -->|"apiserver proxy to kubelet"| CAD["cAdvisor\n(built into kubelet, per node)"]
     end
     Prom -->|"rule_files: alerts.yml"| Rules[(Alerting rules)]
-    Prom -->|fires alerts| AM["Alertmanager :9093\n(no receiver wired yet)"]
+    Prom -->|fires alerts| AM["Alertmanager :9093"]
+    AM -->|discord_configs webhook| Discord["Discord channel"]
     Prom --> Graf["Grafana :3000\nPVC-backed (2Gi)\nprovisioned datasource"]
     Graf --> Dash["Dashboard: Task Tracking Backend\n(auto-provisioned JSON)"]
 
     subgraph Logs collection
         FluentdDS["Fluentd DaemonSet\n(1 pod per node)"] -->|"tails /var/log\non every node, authenticated"| ES["Elasticsearch 8.17.0 :9200\nsingle-node, xpack.security on\nPVC-backed (20Gi)"]
     end
-    ES --> Kib["Kibana :5601\n(elastic superuser)"]
+    ES --> Kib["Kibana :5601\n(kibana_system account)"]
 ```
 
 ### 4.1 Metrics collection — Prometheus service discovery
@@ -150,34 +151,34 @@ once during a rollout. It also mounts a `prometheus-rules` ConfigMap
 (`rule_files: /etc/prometheus/rules/*.yml`) and is configured with an
 `alerting.alertmanagers` target pointing at the `alertmanager` Service — see §4.1a.
 
-### 4.1a Alerting — Prometheus rules + Alertmanager
+### 4.1a Alerting — Prometheus rules + Alertmanager → Discord
 
 [`monitoring/base/prometheus-rules-configmap.yaml`](../monitoring/base/prometheus-rules-configmap.yaml)
 defines the alerting rules Prometheus evaluates continuously; on a breach it pushes
 the alert to [`monitoring/base/alertmanager-deployment.yaml`](../monitoring/base/alertmanager-deployment.yaml),
 a single-replica Alertmanager (`prom/alertmanager:v0.27.0`, Service on `:9093`)
-which handles grouping/dedup and would route to a real notification channel.
+which handles grouping/dedup and routes to Discord.
 
-| Alert | Fires when | Severity |
-|---|---|---|
-| `TargetDown` | Any scrape target unreachable for 5m | critical |
-| `BackendHighErrorRate` | Backend 5xx rate > 5% for 5m | warning |
-| `BackendHighP95Latency` | Backend p95 latency > 1s for 10m | warning |
-| `MySQLDown` | `mysql_up == 0` for 5m | critical |
-| `PodCrashLooping` | A container restarts >3 times in 15m | warning |
-| `PodNotReady` | A pod stays non-ready for 15m | warning |
-| `NodeHighCPU` | Node CPU > 85% for 15m | warning |
-| `NodeLowMemory` | Node available memory < 10% for 15m | warning |
-| `NodeDiskSpaceLow` | A node filesystem < 10% free for 15m | warning |
+| Alert | Fires when | Why it matters | Severity |
+|---|---|---|---|
+| `TargetDown` | `up == 0` for any scrape target for 5m | Prometheus has lost visibility into that workload entirely — could mean the pod crashed, the exporter died, or a NetworkPolicy/DNS problem | critical |
+| `BackendHighErrorRate` | Backend 5xx rate > 5% of requests for 5m | Users are hitting server errors, not client mistakes (4xx isn't counted) | warning |
+| `BackendHighP95Latency` | Backend p95 latency > 1s for 10m | 1 in 20 requests is slow enough to feel broken; p95 (not average) so a few slow outliers don't hide a real regression | warning |
+| `MySQLDown` | `mysql_up == 0` for 5m | mysqld-exporter can't reach the database — the whole app is effectively down without it | critical |
+| `PodCrashLooping` | A container restarts more than 3 times within a 15m window | Distinguishes a genuine crash loop from a one-off restart (deploy, OOM once, node drain) | warning |
+| `PodNotReady` | A **Running** pod fails its readiness probe for 15m | Scoped to `phase="Running"` specifically so a normally-completed batch pod (e.g. `elastic-bootstrap-kibana-user`, which is "not ready" forever once it exits) doesn't fire this permanently — learned the hard way when this fired continuously before the fix | warning |
+| `NodeHighCPU` | Node CPU utilization > 85% for 15m | Sustained (not spiky) CPU pressure — a precursor to pod scheduling/throttling problems | warning |
+| `NodeLowMemory` | Node available memory < 10% of total for 15m | Precursor to the kernel OOM-killer picking off pods on that node | warning |
+| `NodeDiskSpaceLow` | A node filesystem has < 10% free for 15m | Kubelet starts evicting pods well before a disk actually fills to 100% | warning |
 
-**This closes the collection/evaluation half of alerting, not the paging half.**
-`alertmanager-config` ConfigMap's only receiver is `default`, with no
-`slack_configs`/`pagerduty_configs`/`email_configs`/`webhook_configs` underneath
-it — firing alerts are recorded and visible via the Alertmanager API/UI, but
-nothing actually notifies a human, because that requires a real endpoint and
-credentials (a Slack webhook URL, a PagerDuty integration key, SMTP credentials,
-etc.) that only the app owner can supply. Add one under `receivers` in that
-ConfigMap to make paging real.
+**Discord delivery**: `alertmanager-config` is a Secret (not a ConfigMap — the
+webhook URL is a bearer credential, same reasoning as any other credential in
+this repo) holding `alertmanager.yml` with a `discord` receiver using
+Alertmanager's native `discord_configs` (supported since Alertmanager v0.25,
+no separate relay needed). `send_resolved: true` means Discord also gets a
+follow-up message when an alert clears, not just when it fires. Verified
+working end-to-end by posting synthetic alerts directly to Alertmanager's
+`/api/v2/alerts` API and confirming delivery.
 
 ### 4.2 Backend metrics (FastAPI)
 
@@ -191,37 +192,66 @@ tasks_updated_total = Counter("task_tracking_tasks_updated_total", "Tasks update
 tasks_deleted_total = Counter("task_tracking_tasks_deleted_total", "Tasks deleted")
 ```
 
-| Metric | Type | What it captures |
-|---|---|---|
-| `http_requests_total{handler,status,method}` | counter | Every request handled by FastAPI, labeled by route and response status |
-| `http_request_duration_seconds_bucket` | histogram | Request latency distribution (used for p95/p99) |
-| `http_request_duration_highr_seconds_bucket` | histogram | High-resolution latency buckets (used for p99) |
-| `task_tracking_tasks_created_total` | counter | Incremented on every `POST /tasks` / `POST /api/tasks` |
-| `task_tracking_tasks_updated_total` | counter | Incremented on every `PATCH /tasks/{id}` |
-| `task_tracking_tasks_deleted_total` | counter | Incremented on every `DELETE /tasks/{id}` |
-| `process_resident_memory_bytes` | gauge | Backend process RSS (from the Python Prometheus client's default process collector) |
-| `process_cpu_seconds_total` | counter | Backend process CPU time |
-| `process_open_fds` | gauge | Open file descriptors |
+Calling `Instrumentator().instrument(app)` with no explicit `.add(...)` calls
+registers the library's bundled **default** metric set — request counting,
+latency, and payload size, all wired into FastAPI's middleware so every request
+is measured with no per-route code needed. On top of that, three custom
+`Counter`s track domain-specific events the generic HTTP instrumentation has no
+way to know about (a `PATCH` could be a no-op update or a real one; only the
+handler itself knows a task was actually created/updated/deleted).
+
+| Metric | Type | What it actually measures | Why you'd look at it |
+|---|---|---|---|
+| `http_requests_total{handler,status,method}` | counter | One increment per completed request, labeled by route template (`handler`, e.g. `/tasks/{task_id}` — not the literal URL, so `/tasks/1` and `/tasks/2` share a series), HTTP method, and response status code | Traffic volume and error rate per endpoint. `sum(rate(...))` gives requests/sec; filtering `status=~"5.."` isolates server errors (this is what `BackendHighErrorRate` alerts on) |
+| `http_request_duration_seconds_bucket` | histogram | How long each request took to handle, bucketed by duration, labeled by `handler` | Feeds `histogram_quantile(0.95, ...)` for **p95 latency per route** — which specific endpoint is slow, not just "the API" in aggregate |
+| `http_request_duration_highr_seconds_bucket` | histogram | The same latency measurement, but with finer-grained buckets and **without** the `handler` label | Trades per-route breakdown for bucket precision — used for an accurate **overall p99** (§4.5's dashboard), since fine buckets need low cardinality to stay cheap to store |
+| `http_request_size_bytes` | summary | Size of the request body Prometheus received | Rarely alerted on, but flags e.g. a client suddenly sending unexpectedly large payloads |
+| `http_response_size_bytes` | summary | Size of the response body sent back | Same use case in reverse — catches responses ballooning (e.g. `GET /tasks` growing unbounded as the table grows, with no pagination) |
+| `task_tracking_tasks_created_total` | counter | Incremented once per successful `POST /tasks` / `POST /api/tasks` — *after* the DB commit succeeds, so it only counts tasks that actually persisted | Real usage/business metric — how many tasks are actually being created, independent of how many `POST` requests came in (some may 4xx/5xx and never reach the increment) |
+| `task_tracking_tasks_updated_total` | counter | Same, for `PATCH /tasks/{id}` after commit | Task-editing activity over time |
+| `task_tracking_tasks_deleted_total` | counter | Same, for `DELETE /tasks/{id}` after commit | Task-deletion activity — a sudden spike here alongside no corresponding creates could flag a bug or bulk-delete incident |
+| `process_resident_memory_bytes` | gauge | The backend process's RSS (physical memory actually in RAM, not just allocated) at scrape time, from the Python client's built-in process collector | Memory leak detection — a steady upward trend with no corresponding traffic growth is the classic leak signature |
+| `process_cpu_seconds_total` | counter | Cumulative CPU-seconds consumed by the process since it started | `rate()` of this gives CPU utilization; compare against the `500m` CPU limit in [`base/backend-deployment.yaml`](../base/backend-deployment.yaml) to see how close to throttling the pod is running |
+| `process_open_fds` | gauge | Number of file descriptors currently open (sockets, files) | Catches FD leaks (e.g. DB connections opened but never closed) before the process hits its FD limit and starts failing to accept new connections |
 
 `/healthz` is a plain liveness/readiness endpoint (`{"status": "ok"}`), used by
 the Deployment's `readinessProbe`/`livenessProbe` — it is not a Prometheus metric.
 
 ### 4.3 Frontend metrics (nginx-exporter)
 
-The `nginx-exporter` sidecar scrapes nginx's built-in `/stub_status` page and
-re-exposes it as Prometheus metrics on `:9113`: connection counts
-(`nginx_connections_active`, `_reading`, `_writing`, `_waiting`) and request
-totals (`nginx_http_requests_total`). It has no visibility into application-level
-routes — those are only observed at the backend.
+The `nginx-exporter` sidecar (`nginx/nginx-prometheus-exporter`) scrapes nginx's
+built-in `/stub_status` page on `127.0.0.1:8080` (nginx's own lightweight status
+endpoint, not a Prometheus format) and translates it into Prometheus metrics on
+`:9113`. It only sees **connection-level** activity — TCP-level facts about
+nginx's own worker processes — it has no idea what a "task" or a "route" is;
+that's only observable at the backend (§4.2).
+
+| Metric | Type | What it actually measures | Why you'd look at it |
+|---|---|---|---|
+| `nginx_connections_active` | gauge | Connections currently open to nginx (established, not necessarily doing anything) | The headline "how busy is the frontend right now" number |
+| `nginx_connections_reading` | gauge | Connections where nginx is still reading the incoming request headers | High values suggest slow/malicious clients (slow-loris-style), or a network problem upstream of nginx |
+| `nginx_connections_writing` | gauge | Connections where nginx is writing the response back to the client | High values suggest nginx is serving large responses or clients have slow downlinks |
+| `nginx_connections_waiting` | gauge | Idle keep-alive connections, open but not actively reading/writing | Normal at any nontrivial traffic level (HTTP keep-alive reusing connections) — a sudden drop to near-zero can indicate clients aren't reusing connections (e.g. a proxy/LB misconfiguration) |
+| `nginx_http_requests_total` | counter | Total requests nginx has processed since start | `rate()` gives frontend-level requests/sec — compare against the backend's `http_requests_total` rate; a gap between the two suggests nginx is serving static assets (JS/CSS/images) that never reach the backend at all |
 
 ### 4.4 Database metrics (mysqld-exporter)
 
 `mysqld-exporter` connects to MySQL as a scoped `exporter` user granted only
 `PROCESS`, `REPLICATION CLIENT`, and `SELECT ON performance_schema.*`
-(created via [`base/mysql-init-configmap.yaml`](../base/mysql-init-configmap.yaml)).
-Standard `mysqld_exporter` metrics include connection counts, query throughput,
-InnoDB buffer pool stats, slow query counters, and replication status
-(`mysql_global_status_*`, `mysql_global_variables_*`).
+(created via [`base/mysql-init-configmap.yaml`](../base/mysql-init-configmap.yaml)) —
+deliberately not a superuser, since the exporter only needs to *read* server
+status, never touch application data. It exposes MySQL's own internal status
+counters (`SHOW GLOBAL STATUS`, `SHOW GLOBAL VARIABLES`, and `performance_schema`
+tables) as Prometheus metrics on `:9104`.
+
+| Metric | Type | What it actually measures | Why you'd look at it |
+|---|---|---|---|
+| `mysql_up` | gauge | `1` if the exporter's last scrape of MySQL succeeded, `0` if it couldn't connect/query | The single most important DB metric — this is exactly what `MySQLDown` alerts on |
+| `mysql_global_status_threads_connected` | gauge | Number of client connections currently open | Compare against `max_connections` — approaching the ceiling means the next connection attempt (from the backend's connection pool, most likely under load) will be refused |
+| `mysql_global_status_slow_queries` | counter | Count of queries that exceeded `long_query_time` | Rising rate flags queries that need an index or are scanning more rows than expected — this app's whole schema is one `tasks` table (`base/mysql-init-configmap.yaml`), so a slow query here almost certainly means a missing/ineffective index on it |
+| `mysql_global_status_questions` / `_queries` | counter | Total statements executed against the server | `rate()` gives queries/sec — the DB-side equivalent of `http_requests_total`'s request rate, useful for correlating "is the DB the bottleneck when the backend is slow" |
+| `mysql_global_status_innodb_buffer_pool_pages_free` vs `_total` | gauge | How much of InnoDB's in-memory page cache is still free | Sustained near-zero free pages under a growing dataset is the leading indicator that `innodb_buffer_pool_size` needs to increase before performance degrades |
+| `mysql_global_variables_max_connections` | gauge | The configured connection ceiling | Static context metric — graphed alongside `threads_connected` to show utilization as a percentage rather than a raw count |
 
 ### 4.5 Grafana
 
@@ -271,35 +301,72 @@ auto-provisions everything at pod startup — nothing needs to be configured by 
   real use). Ingress to Elasticsearch is restricted by a NetworkPolicy
   ([`monitoring/base/networkpolicy.yaml`](../monitoring/base/networkpolicy.yaml))
   to only the `kibana` and `fluentd` pods, on port 9200.
-- **Kibana** authenticates to Elasticsearch as the `elastic` superuser
-  (`ELASTICSEARCH_USERNAME`/`_PASSWORD` env vars, same Secret). Using the
-  superuser here — rather than a scoped `kibana_system` service account/token —
-  is a deliberate simplification: minting a service token is an imperative
-  `elasticsearch-service-tokens` API call, not something expressible in a static
-  Secret/ConfigMap without a Job/init-container to run it. Kibana itself has no
-  inbound NetworkPolicy allowances (`ingress: []`, fully closed) since it's only
-  ever reached via `kubectl port-forward` from the `eks-admin` bastion (§5), which
-  bypasses normal pod-network policy enforcement. No index patterns or saved
-  dashboards are pre-provisioned — those would need to be created manually in the
-  Kibana UI.
+- **Kibana** authenticates to Elasticsearch as the built-in `kibana_system`
+  account — **not** the `elastic` superuser. This was a real bug found live:
+  Kibana 8.x hard-rejects `elastic` as its own configured username at startup
+  (`config validation ... "elastic" is forbidden`, not just a permissions
+  complaint) and crash-loops. `kibana_system`'s password isn't settable via an
+  env var the way `ELASTIC_PASSWORD` is, so
+  [`monitoring/base/elastic-bootstrap-job.yaml`](../monitoring/base/elastic-bootstrap-job.yaml)
+  is a one-time Kubernetes `Job` that waits for Elasticsearch to be reachable,
+  then calls its `_security/user/kibana_system/_password` API (authenticating as
+  `elastic`) to set it. `ttlSecondsAfterFinished: 300` cleans the completed Job
+  pod up automatically — without it, `kube_pod_status_ready` reports the
+  finished pod as permanently "not ready," which was itself a second bug found
+  live (§4.1a's `PodNotReady` note). Kibana itself has no inbound NetworkPolicy
+  allowances (`ingress: []`, fully closed) since it's only ever reached via
+  `kubectl port-forward` from the `eks-admin` bastion (§5), which bypasses
+  normal pod-network policy enforcement. No index patterns or saved dashboards
+  are pre-provisioned — those would need to be created manually in the Kibana UI.
 
 ### 4.7 Node & container-level metrics
 
 Beyond what each application/exporter chooses to expose on its own `/metrics`,
-three more sources give Kubernetes resource-level visibility (pod restarts,
-node pressure, per-container CPU/memory):
+three more sources give Kubernetes resource-level visibility — the difference
+between them is *where* the data comes from: the Kubernetes API server itself
+(object state), each node's kernel (`/proc`/`/sys`), or each node's container
+runtime (per-container cgroup accounting):
 
-| Source | Deployed as | What it captures |
+| Source | Deployed as | What it actually measures |
 |---|---|---|
-| [`kube-state-metrics`](../monitoring/base/kube-state-metrics.yaml) | Deployment, own ClusterRole (read-only on pods/nodes/deployments/statefulsets/jobs/etc.) | Kubernetes **object state**: `kube_pod_status_ready`, `kube_pod_container_status_restarts_total`, `kube_deployment_status_replicas_available`, and equivalents for DaemonSets/StatefulSets/Jobs — not resource usage, just what the API server reports |
-| [`node-exporter`](../monitoring/base/node-exporter.yaml) | DaemonSet, `hostNetwork`/`hostPID`, read-only hostPath mounts of `/proc`, `/sys`, `/` | **Host-level** CPU (`node_cpu_seconds_total`), memory (`node_memory_MemAvailable_bytes`), disk (`node_filesystem_avail_bytes`), network (`node_network_receive_bytes_total`) |
-| cAdvisor (built into every kubelet, no separate deployment) | Prometheus job `kubernetes-nodes-cadvisor`, scraped via the API server's node proxy (`/api/v1/nodes/<node>/proxy/metrics/cadvisor`), authenticated with Prometheus's own service account token | **Per-container** resource usage: `container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`, `container_network_*`, `container_fs_*` — this is what CPU-throttling/OOM-type dashboards are built on |
+| [`kube-state-metrics`](../monitoring/base/kube-state-metrics.yaml) | Deployment, own ClusterRole (read-only on pods/nodes/deployments/statefulsets/jobs/etc.) | Kubernetes **object state** — what the API server reports, not real resource usage |
+| [`node-exporter`](../monitoring/base/node-exporter.yaml) | DaemonSet, `hostNetwork`/`hostPID`, read-only hostPath mounts of `/proc`, `/sys`, `/` | **Host-level** OS metrics, read directly from the kernel |
+| cAdvisor (built into every kubelet, no separate deployment) | Prometheus job `kubernetes-nodes-cadvisor`, scraped via the API server's node proxy (`/api/v1/nodes/<node>/proxy/metrics/cadvisor`), authenticated with Prometheus's own service account token | **Per-container** resource usage, attributed to individual pods/containers via cgroups |
 
-These feed the `PodCrashLooping`, `PodNotReady`, `NodeHighCPU`, `NodeLowMemory`,
-and `NodeDiskSpaceLow` alert rules (§4.1a). No Grafana dashboard panels
-consume them yet — only the `Task Tracking Backend` dashboard (§4.5) exists;
-building a node/cluster-resource dashboard from these metrics is straightforward
-but not done here.
+**kube-state-metrics** — object state, not usage:
+
+| Metric | What it actually measures | Why you'd look at it |
+|---|---|---|
+| `kube_pod_status_ready{condition}` | Whether a pod's readiness probe is currently passing (`condition="true"`/`"false"`) | Feeds `PodNotReady` — a pod can be `Running` but still failing its own app-level health check |
+| `kube_pod_status_phase{phase}` | Which lifecycle phase a pod is in (`Pending`/`Running`/`Succeeded`/`Failed`) | Used to *filter* `PodNotReady` down to `phase="Running"` only, so a completed one-shot Job pod (permanently "not ready" once it exits) doesn't fire the alert forever |
+| `kube_pod_container_status_restarts_total` | Cumulative restart count per container | `increase(...[15m]) > 3` is exactly `PodCrashLooping`'s trigger |
+| `kube_deployment_status_replicas_available` | How many of a Deployment's desired replicas are actually `Ready` | Compare against `spec.replicas` (e.g. `backend`'s 2) to see partial-availability incidents that a simple "is it up" check would miss |
+
+**node-exporter** — host OS metrics:
+
+| Metric | What it actually measures | Why you'd look at it |
+|---|---|---|
+| `node_cpu_seconds_total{mode}` | Cumulative CPU time per core per mode (`idle`, `user`, `system`, `iowait`, ...) | `NodeHighCPU`'s `100 - (rate(...{mode="idle"}) * 100)` derives utilization from idle time — standard node-exporter idiom |
+| `node_memory_MemAvailable_bytes` | Kernel's own estimate of memory available for new workloads (accounts for reclaimable cache, unlike raw "free") | What `NodeLowMemory` alerts on — a more accurate OOM predictor than `MemFree` alone |
+| `node_filesystem_avail_bytes` / `_size_bytes` | Free vs. total space per mounted filesystem | `NodeDiskSpaceLow`'s ratio — note the alert excludes `tmpfs`/`overlay` filesystems to avoid noise from ephemeral/container-layer mounts |
+| `node_network_receive_bytes_total` / `_transmit_bytes_total` | Cumulative bytes in/out per network interface | Not alerted on here, but `rate()` gives node-level network throughput — useful for spotting a node saturating its ENI bandwidth |
+
+**cAdvisor** — per-container resource usage (the granularity node-exporter can't
+give you, since node-exporter only sees the *host* total, not which container
+is responsible for it):
+
+| Metric | What it actually measures | Why you'd look at it |
+|---|---|---|
+| `container_cpu_usage_seconds_total` | Cumulative CPU time consumed by one specific container | `rate()` per-container, compared against that container's `resources.limits.cpu` — this is how you'd actually diagnose *which* backend pod is CPU-throttling, not just that the node is busy |
+| `container_memory_working_set_bytes` | The memory the kernel considers "in active use" by that container — this is what the OOM-killer and Kubernetes' own eviction logic actually watch, not `container_memory_usage_bytes` (which also counts easily-reclaimable page cache) | The right metric to compare against a container's `resources.limits.memory` to predict an OOMKill before it happens |
+| `container_network_receive_bytes_total` / `_transmit_bytes_total` | Bytes in/out per container's network namespace | Per-pod network usage, e.g. spotting one backend replica handling disproportionate traffic behind the Service's load-balancing |
+| `container_fs_usage_bytes` | Writable-layer disk usage per container | Catches a container writing unexpectedly large amounts to its ephemeral filesystem (logs, temp files) |
+
+Together these feed the `PodCrashLooping`, `PodNotReady`, `NodeHighCPU`,
+`NodeLowMemory`, and `NodeDiskSpaceLow` alert rules (§4.1a). No Grafana
+dashboard panels consume them yet — only the `Task Tracking Backend` dashboard
+(§4.5) exists; building a node/cluster-resource dashboard from these metrics is
+straightforward but not done here.
 
 ## 5. Cluster access path (how you actually reach any of this)
 
@@ -329,27 +396,28 @@ flowchart LR
 ## 6. Notable gaps
 
 The four gaps below were identified in an earlier revision of this document and
-have since been closed in the manifests (§4.1a, §4.5, §4.6, §4.7). One real gap
-remains from the first item, and a couple of honest simplifications were made
-closing the others — both called out explicitly rather than glossed over:
+have since been closed in the manifests (§4.1a, §4.5, §4.6, §4.7). A couple of
+honest simplifications were made closing them — called out explicitly rather
+than glossed over:
 
-- ~~No Alertmanager or alerting rules~~ — **Alerting rules + Alertmanager are now
-  deployed** (§4.1a), but **no real notification receiver is configured** (no
-  Slack/PagerDuty/email endpoint) — that requires credentials only the app owner
-  can supply. Alerts fire and are visible in Alertmanager; nobody gets paged
-  until a receiver is added.
+- ~~No Alertmanager or alerting rules~~ — **fully closed** (§4.1a): alerting
+  rules, Alertmanager, and a real Discord receiver (`discord_configs`, native
+  support since Alertmanager v0.25) are all deployed and verified working —
+  synthetic test alerts posted directly to Alertmanager's API were confirmed
+  delivered to Discord. `send_resolved: true` also notifies when an alert clears.
 - ~~No persistent storage for Prometheus or Grafana~~ — **both now have PVCs**
   (10Gi / 2Gi respectively, §4.1/§4.5) and survive pod restarts.
 - ~~Elasticsearch and Kibana have no authentication and no NetworkPolicy~~ —
   **both fixed** (§4.6): `xpack.security.enabled: true` with a bootstrap
-  `elastic` password, and NetworkPolicies restricting Elasticsearch ingress to
-  Kibana/Fluentd and denying all ingress to Kibana. Two simplifications worth
-  knowing about: (1) Kibana authenticates as the `elastic` superuser rather than
-  a scoped `kibana_system` service token, since minting one is an imperative API
-  call this static-manifest setup doesn't have a step for; (2) HTTP/transport TLS
-  is explicitly disabled on Elasticsearch (acceptable for a single node with no
-  inter-node traffic, but means the `elastic` password still travels in
-  plaintext between Fluentd/Kibana and Elasticsearch inside the cluster network).
+  `elastic` password, Kibana authenticating as the scoped `kibana_system`
+  account (its password set by a one-time bootstrap Job, since Kibana 8.x
+  actually refuses to start when configured with the `elastic` superuser —
+  a real bug hit and fixed live), and NetworkPolicies restricting Elasticsearch
+  ingress to Kibana/Fluentd and denying all ingress to Kibana. One simplification
+  worth knowing about: HTTP/transport TLS is explicitly disabled on Elasticsearch
+  (acceptable for a single node with no inter-node traffic, but means passwords
+  still travel in plaintext between Fluentd/Kibana and Elasticsearch inside the
+  cluster network).
 - ~~No cAdvisor/node-level metrics~~ — **fixed** (§4.7): `node-exporter`
   (host CPU/memory/disk/network), `kube-state-metrics` (Kubernetes object
   state), and a cAdvisor scrape job (per-container resource usage) are all
