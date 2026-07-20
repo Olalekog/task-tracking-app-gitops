@@ -23,7 +23,7 @@ stringData:
     receivers:
       - name: discord
         discord_configs:
-          - webhook_url: "https://discordapp.com/api/webhooks/1528785054673797270/0xDk1fjgxc1pDmfPIucFD7XgxWRz9gcsBhMBiMcLATBdq2tFqr58lu_hmfk_r4SJcP-a"
+          - webhook_url: "https://discordapp.com/api/webhooks/1528788955036778587/S8D0crrq9SgGyLliUY3EXKaPm4BjWxQ06bkNzbLO6SBgn-x1aOmb27J7KuRUJnxknxhl"
             send_resolved: true
 ---
 apiVersion: apps/v1
