@@ -635,6 +635,157 @@ flowchart LR
   `server.insecure: "true"` (in its `argocd-cmd-params-cm` ConfigMap), so it serves
   plain HTTP, not TLS — connect via `http://`, not `https://`, on its forwarded port.
 
+### 5.1 Direct kubectl access from an operator's own machine (SSM tunnel + personal access entry)
+
+**What:** a second access path, independent of the `eks-admin` bastion's own
+`kubectl port-forward` hops above — an SSM port-forward straight from an
+operator's laptop to the EKS API server itself, combined with a personal IAM
+access entry, so `kubectl` runs natively on the laptop instead of through a
+shell on the bastion.
+
+**Why:** the path above only gets you a UI in a browser tab, one Service at a
+time (`kubectl port-forward` run *on* the bastion). It doesn't give you a
+working `kubectl` on your own machine — no local editor/IDE Kubernetes
+integration, no scripting against the cluster from your own shell. This path
+fills that gap, and it surfaced a failure mode worth knowing about:
+`kubectl` hanging/timing out and `kubectl` failing fast with "the server has
+asked for the client to provide credentials" look like the same generic
+"connection's down" symptom, but have opposite causes and fixes — see the
+table below.
+
+**How:**
+
+```mermaid
+flowchart LR
+    Laptop["Operator laptop\nkubectl (context: eks-dev-tunnel)"] -->|"aws ssm start-session\nAWS-StartPortForwardingSessionToRemoteHost\nhost=&lt;api-server&gt;, localPort=8443"| Bastion[eks-admin EC2 instance]
+    Bastion -->|"TCP passthrough to :443"| API["EKS API server\n(private endpoint)"]
+```
+
+1. **Tunnel** — port-forward from the laptop through the bastion straight to
+   the API server's hostname/port (not to a cluster Service, unlike the UI
+   path above):
+
+   ```bash
+   aws ssm start-session --region us-east-1 --target <eks-admin-instance-id> \
+     --document-name AWS-StartPortForwardingSessionToRemoteHost \
+     --parameters host="<api-server-hostname>",portNumber="443",localPortNumber="8443"
+   ```
+
+2. **Local kubeconfig** — a `127.0.0.1:8443` server won't match the API
+   server's real TLS certificate, so the cluster entry sets `tls-server-name`
+   explicitly to the real hostname (kubectl then sends the correct SNI and
+   validates against the correct CN, while physically connecting to
+   localhost):
+
+   ```bash
+   kubectl config set-cluster eks-dev-tunnel --server=https://127.0.0.1:8443 \
+     --embed-certs=true --certificate-authority=<decoded CA pem>
+   kubectl config set clusters.eks-dev-tunnel.tls-server-name "<api-server-hostname>"
+   kubectl config set-credentials eks-dev-tunnel-user --exec-command=aws \
+     --exec-api-version=client.authentication.k8s.io/v1beta1 \
+     --exec-arg=--region --exec-arg=us-east-1 --exec-arg=eks --exec-arg=get-token \
+     --exec-arg=--cluster-name --exec-arg=task-tracking-dev-eks
+   kubectl config set-context eks-dev-tunnel --cluster=eks-dev-tunnel --user=eks-dev-tunnel-user
+   ```
+
+3. **Access entry** — grants the operator's own IAM identity cluster access
+   (the cluster's `authenticationMode: API_AND_CONFIG_MAP` supports this
+   without touching the `aws-auth` ConfigMap):
+
+   ```bash
+   aws eks create-access-entry --cluster-name task-tracking-dev-eks --region us-east-1 \
+     --principal-arn arn:aws:iam::<account>:user/<iam-user> --type STANDARD
+   aws eks associate-access-policy --cluster-name task-tracking-dev-eks --region us-east-1 \
+     --principal-arn arn:aws:iam::<account>:user/<iam-user> \
+     --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+     --access-scope type=cluster
+   ```
+
+> **Operational note learned live:** a "connection is down" symptom from a
+> laptop against this cluster is almost never the cluster actually being
+> unhealthy — it's one of two access-layer problems, and they need opposite
+> fixes even though `kubectl`'s own error output doesn't clearly distinguish
+> them:
+>
+> | Symptom | Actual cause | Fix |
+> | --- | --- | --- |
+> | `kubectl` hangs, then times out; a raw `curl` to the endpoint also times out (`curl` exit 28) | Laptop isn't in the VPC — the endpoint has `endpointPublicAccess: false` | Tunnel through a VPC-resident host (this section), or a VPN, or — not done here — enable public access scoped to a CIDR |
+> | `kubectl` fails fast with `Unauthorized` / "the server has asked for the client to provide credentials", even with a freshly-signed token that decodes fine | The IAM principal has no EKS access entry (or `aws-auth` mapping) — this is a 401, returned *before* RBAC is ever evaluated, not a 403 | `aws eks create-access-entry` + `associate-access-policy` for that principal |
+>
+> Both were hit in sequence setting this up: fixing the network problem first
+> just exposed the auth problem next. A 401 on *every* request — including
+> ones sent with a valid, freshly-generated token — is the tell that it's the
+> second one, not the first: at the time only `task-tracking-dev-eks-admin-role`,
+> `task-tracking-dev-eks-node-role`, and `Reactjs-application-role` had access
+> entries; no individual IAM user did.
+
+This access entry is a standing grant that lives outside this repo — EKS
+access entries are an account/cluster-level IAM construct, not a Kubernetes
+object, so Argo CD never sees it, it won't show up in a diff against these
+manifests, and it won't be reverted by `selfHeal` the way §3/§4.1a describe
+for actual in-cluster resources.
+
+### 5.2 Reaching each UI directly from the tunnel context
+
+**What:** once §5.1's tunnel/context/access-entry setup is done once, every
+UI in this stack is a single `kubectl port-forward` away, run directly from
+the operator's own machine — no second hop onto the bastion needed, unlike
+§5's `kubectl port-forward` run *on* `eks-admin`. `kubectl port-forward`
+proxies through the API server itself, and the API server is exactly what
+§5.1's tunnel already reaches.
+
+**Why:** §5 describes the general double-hop path (useful when no
+per-operator access entry exists yet, e.g. a fresh laptop). Once an access
+entry does exist, the extra hop onto the bastion is pure overhead — the same
+tunnel already terminates at the API server, and `kubectl port-forward`
+doesn't care whether it's invoked from the bastion or from a laptop with a
+valid context.
+
+**How:** each command below is long-running and blocking (one terminal per
+UI; `Ctrl+C` to stop; multiple can run at once since each binds a different
+local port). All go through the same `eks-dev-tunnel` context and its
+underlying SSM tunnel (§5.1) — if that tunnel has died, these fail with a
+connection error and the tunnel needs restarting first, not the port-forward
+itself.
+
+| UI | Command | URL | Credentials |
+| --- | --- | --- | --- |
+| Grafana | `kubectl --context eks-dev-tunnel port-forward -n monitoring svc/grafana 3000:3000` | `http://localhost:3000` | `admin` / `admin` (only valid on a fresh PVC — see §4.5's note; use `grafana-cli admin reset-admin-password` inside the pod otherwise) |
+| Prometheus | `kubectl --context eks-dev-tunnel port-forward -n monitoring svc/prometheus 9090:9090` | `http://localhost:9090` | none |
+| ArgoCD | `kubectl --context eks-dev-tunnel port-forward -n argocd-ns svc/argocd-server 8080:80` | `http://localhost:8080` (not https — `server.insecure: true`, per §5) | `admin` / `kubectl --context eks-dev-tunnel -n argocd-ns get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' \| base64 -d` |
+| Kibana | `kubectl --context eks-dev-tunnel port-forward -n monitoring svc/kibana 5601:5601` | `http://localhost:5601` | `elastic` / `kubectl --context eks-dev-tunnel -n monitoring get secret elastic-credentials -o jsonpath='{.data.ELASTIC_PASSWORD}' \| base64 -d` — **not** `kibana_system`, which is only for Kibana's own internal auth to Elasticsearch (§4.6) |
+
+> **Operational note learned live: `ERR_CONNECTION_REFUSED` isn't always the
+> tunnel.** A browser refusing one of these `localhost` URLs has (at least)
+> three independent possible causes, and they need different fixes:
+>
+> | Symptom | Actual cause | Fix |
+> | --- | --- | --- |
+> | All four URLs refuse the connection | The SSM tunnel itself (§5.1) died | Restart the `aws ssm start-session ... AWS-StartPortForwardingSessionToRemoteHost` command |
+> | Only one URL refuses, others work | That specific `kubectl port-forward` was never started, or exited | Re-run just that command; `netstat -ano \| findstr :<port>` (or `ss -ltnp` on Linux) confirms whether anything is actually listening on the local port before blaming the cluster |
+> | `kubectl port-forward` itself exits immediately with `unable to forward port because pod is not running` | The target pod isn't `Running` — check `kubectl get pods -n <ns>` first | Fix whatever's keeping the pod down, *then* start the port-forward — it does not retry/wait on its own |
+>
+> The third case was hit live: `grafana` and `prometheus` (both PVC-backed,
+> §4.1/§4.5) were stuck `Pending`/`ContainerCreating` because the two EKS
+> worker nodes had rotated (old nodes terminated, replaced by new ones) only
+> minutes earlier, and each pod's EBS volume still had a stale
+> `VolumeAttachment` object pointing at its old, now-nonexistent node —
+> `kubectl describe pod` showed `FailedAttachVolume ... Multi-Attach error`.
+> `aws ec2 describe-volumes` confirmed the volumes were already `available`
+> (fully detached) at the AWS API level, meaning it was purely stale
+> Kubernetes metadata, not an actual stuck AWS attachment — Kubernetes'
+> attach-detach-controller reconciles this automatically once it notices the
+> old `Node` objects are gone, which is exactly what happened here (both
+> pods went `Running` within a couple of minutes without any manual
+> intervention). If it doesn't self-resolve, `kubectl get volumeattachments`
+> lists them by name for a targeted `kubectl delete volumeattachment
+> <name>` — safe to do once `describe-volumes` confirms AWS-side detachment,
+> since deleting the stale object triggers no real attach/detach action.
+> This is orthogonal to §5.1's private-endpoint/access-entry failure modes:
+> those are about *reaching the API server at all*; this one only shows up
+> once you're already through and asking the API server to schedule/attach
+> something.
+
 ## 6. Notable gaps
 
 The gaps below were identified in an earlier revision of this document and have
