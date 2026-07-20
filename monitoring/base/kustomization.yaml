@@ -9,6 +9,7 @@ resources:
   - alertmanager-deployment.yaml
   - grafana-provisioning-configmap.yaml
   - grafana-dashboard-backend-configmap.yaml
+  - grafana-dashboard-node-configmap.yaml
   - grafana-deployment.yaml
   - elastic-secret.yaml
   - elastic-bootstrap-job.yaml

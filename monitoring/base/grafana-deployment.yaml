@@ -53,6 +53,8 @@ spec:
               mountPath: /etc/grafana/provisioning/dashboards
             - name: dashboard-backend
               mountPath: /var/lib/grafana/dashboards
+            - name: dashboard-node
+              mountPath: /var/lib/grafana/dashboards/node
             - name: data
               mountPath: /var/lib/grafana
           resources:
@@ -72,6 +74,9 @@ spec:
         - name: dashboard-backend
           configMap:
             name: grafana-dashboard-backend
+        - name: dashboard-node
+          configMap:
+            name: grafana-dashboard-node
         - name: data
           persistentVolumeClaim:
             claimName: grafana-data

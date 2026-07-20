@@ -111,3 +111,16 @@ data:
             annotations:
               summary: "Node {{ $labels.instance }} filesystem {{ $labels.mountpoint }} below 10% free"
               description: "Available disk space on {{ $labels.mountpoint }} has been below 10% for 15 minutes."
+
+          - alert: NodeDiskIOSaturation
+            # node_disk_io_time_seconds_total is a counter of wall-clock time
+            # the device spent with at least one I/O in flight; its rate is the
+            # fraction of time busy (0-1). Sustained near 1 means reads/writes
+            # are queueing, not just that throughput is high.
+            expr: rate(node_disk_io_time_seconds_total[5m]) > 0.9
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} disk {{ $labels.device }} I/O saturated"
+              description: "Disk {{ $labels.device }} has been busy servicing I/O more than 90% of the time for 15 minutes — reads/writes are likely queueing."
