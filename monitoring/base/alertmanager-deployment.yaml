@@ -1,24 +1,30 @@
+# This holds the Discord webhook URL, which is a bearer credential (anyone with
+# it can post to the channel) — a Secret rather than a ConfigMap, following the
+# same "change-me" placeholder convention as the other Secrets in this repo
+# (base/mysql-secret.yaml, monitoring/base/elastic-secret.yaml). Replace
+# CHANGE-ME-DISCORD-WEBHOOK below with a real webhook URL (Discord channel ->
+# Edit Channel -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL).
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
   name: alertmanager-config
   namespace: monitoring
-data:
-  # No real receiver (Slack/PagerDuty/email/webhook) is configured here: that
-  # requires credentials/endpoints only the app owner can supply. Firing alerts
-  # are still recorded and visible in the Alertmanager UI/API — replace the
-  # "default" receiver below with a real integration to actually page someone.
+type: Opaque
+stringData:
   alertmanager.yml: |
     global:
       resolve_timeout: 5m
     route:
-      receiver: default
+      receiver: discord
       group_by: ["alertname", "namespace"]
       group_wait: 30s
       group_interval: 5m
       repeat_interval: 4h
     receivers:
-      - name: default
+      - name: discord
+        discord_configs:
+          - webhook_url: "https://discordapp.com/api/webhooks/1528785054673797270/0xDk1fjgxc1pDmfPIucFD7XgxWRz9gcsBhMBiMcLATBdq2tFqr58lu_hmfk_r4SJcP-a"
+            send_resolved: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -69,8 +75,8 @@ spec:
               memory: 128Mi
       volumes:
         - name: config
-          configMap:
-            name: alertmanager-config
+          secret:
+            secretName: alertmanager-config
         - name: storage
           emptyDir: {}
 ---
