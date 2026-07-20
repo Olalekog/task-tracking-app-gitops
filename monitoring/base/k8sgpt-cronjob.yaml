@@ -1,0 +1,166 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8sgpt
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8sgpt
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+      - endpoints
+      - events
+      - replicationcontrollers
+      - persistentvolumeclaims
+      - persistentvolumes
+      - namespaces
+      - nodes
+      - configmaps
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8sgpt
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8sgpt
+subjects:
+  - kind: ServiceAccount
+    name: k8sgpt
+    namespace: monitoring
+---
+# Runs k8sgpt as a CronJob rather than the k8sgpt-operator (which needs its
+# own CRDs + controller-manager installed first) — this repo doesn't use Helm
+# for the app/monitoring stack, and a periodic scan-and-notify Job is a much
+# smaller footprint than a full operator for what's needed here.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k8sgpt-scan
+  namespace: monitoring
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: k8sgpt
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: k8sgpt-analyze
+              # Not pinned to a specific version — verify/pin a real release
+              # tag before relying on this beyond initial testing.
+              image: ghcr.io/k8sgpt-ai/k8sgpt:latest
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: k8sgpt-secrets
+                      key: ANTHROPIC_API_KEY
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  k8sgpt auth add --backend anthropic --model claude-3-5-sonnet-20241022 --password "$ANTHROPIC_API_KEY"
+                  k8sgpt analyze --explain --backend anthropic > /shared/result.txt 2>&1 || true
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                - name: shared
+                  mountPath: /shared
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+          containers:
+            - name: notify-discord
+              image: curlimages/curl:8.11.0
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              env:
+                - name: DISCORD_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: k8sgpt-secrets
+                      key: DISCORD_WEBHOOK_URL
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  if [ ! -s /shared/result.txt ] || grep -qi "No problems detected" /shared/result.txt; then
+                    echo "No issues found, nothing to post."
+                    exit 0
+                  fi
+                  BODY=$(head -c 1800 /shared/result.txt)
+                  PAYLOAD=$(printf '{"content":"**k8sgpt cluster diagnostics**\\n```\\n%s\\n```"}' "$(echo "$BODY" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')")
+                  curl -sf -X POST "$DISCORD_WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD"
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            - name: shared
+              emptyDir: {}

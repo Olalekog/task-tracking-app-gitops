@@ -18,4 +18,6 @@ resources:
   - kube-state-metrics.yaml
   - node-exporter.yaml
   - networkpolicy.yaml
+  - k8sgpt-secret.yaml
+  - k8sgpt-cronjob.yaml
   - services.yaml
