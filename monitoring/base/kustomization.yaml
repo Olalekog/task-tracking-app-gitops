@@ -4,10 +4,16 @@ resources:
   - namespace.yaml
   - rbac.yaml
   - prometheus-configmap.yaml
+  - prometheus-rules-configmap.yaml
   - prometheus-deployment.yaml
+  - alertmanager-deployment.yaml
   - grafana-provisioning-configmap.yaml
   - grafana-dashboard-backend-configmap.yaml
   - grafana-deployment.yaml
+  - elastic-secret.yaml
   - elastic-kibana.yaml
   - fluentd-daemonset.yaml
+  - kube-state-metrics.yaml
+  - node-exporter.yaml
+  - networkpolicy.yaml
   - services.yaml

@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  alerts.yml: |
+    groups:
+      - name: target-availability
+        rules:
+          - alert: TargetDown
+            expr: up == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Scrape target down: {{ $labels.job }}/{{ $labels.instance }}"
+              description: "{{ $labels.instance }} (job {{ $labels.job }}) has been unreachable by Prometheus for 5 minutes."
+
+      - name: backend-app
+        rules:
+          - alert: BackendHighErrorRate
+            expr: |
+              sum(rate(http_requests_total{status=~"5..", job="kubernetes-pods", kubernetes_namespace="backend"}[5m]))
+              /
+              sum(rate(http_requests_total{job="kubernetes-pods", kubernetes_namespace="backend"}[5m]))
+              > 0.05
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Backend 5xx rate above 5%"
+              description: "More than 5% of backend HTTP responses have been 5xx over the last 5 minutes."
+
+          - alert: BackendHighP95Latency
+            expr: |
+              histogram_quantile(0.95,
+                sum by (le) (rate(http_request_duration_seconds_bucket{job="kubernetes-pods", kubernetes_namespace="backend"}[5m]))
+              ) > 1
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Backend p95 latency above 1s"
+              description: "95th percentile request latency has been above 1 second for 10 minutes."
+
+      - name: database
+        rules:
+          - alert: MySQLDown
+            expr: mysql_up == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "MySQL exporter reports database down"
+              description: "mysqld_exporter has been unable to reach MySQL for 5 minutes."
+
+      - name: kubernetes-resources
+        rules:
+          - alert: PodCrashLooping
+            expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash-looping"
+              description: "Container {{ $labels.container }} has restarted more than 3 times in the last 15 minutes."
+
+          - alert: PodNotReady
+            expr: sum by (namespace, pod) (kube_pod_status_ready{condition="false"}) > 0
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not ready"
+              description: "Pod has been in a non-ready state for more than 15 minutes."
+
+      - name: node-resources
+        rules:
+          - alert: NodeHighCPU
+            expr: |
+              100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} CPU usage above 85%"
+              description: "Average CPU utilization has been above 85% for 15 minutes."
+
+          - alert: NodeLowMemory
+            expr: |
+              node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100 < 10
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} available memory below 10%"
+              description: "Available memory has been below 10% of total for 15 minutes."
+
+          - alert: NodeDiskSpaceLow
+            expr: |
+              node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} * 100 < 10
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} filesystem {{ $labels.mountpoint }} below 10% free"
+              description: "Available disk space on {{ $labels.mountpoint }} has been below 10% for 15 minutes."

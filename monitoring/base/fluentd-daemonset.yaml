@@ -33,6 +33,13 @@ spec:
               value: elasticsearch.monitoring.svc.cluster.local
             - name: FLUENT_ELASTICSEARCH_PORT
               value: "9200"
+            - name: FLUENT_ELASTICSEARCH_USER
+              value: elastic
+            - name: FLUENT_ELASTICSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: elastic-credentials
+                  key: ELASTIC_PASSWORD
             # These nodes run containerd, not Docker, so the journald/systemd
             # log source (which needs to write a cursor file under the
             # read-only-for-us /var/log hostPath) must be disabled.
@@ -41,6 +48,13 @@ spec:
           volumeMounts:
             - name: varlog
               mountPath: /var/log
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
       volumes:
         - name: varlog
           hostPath:

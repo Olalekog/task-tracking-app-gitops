@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elasticsearch
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: elasticsearch
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: kibana
+        - podSelector:
+            matchLabels:
+              app: fluentd
+      ports:
+        - protocol: TCP
+          port: 9200
+---
+# Kibana is only ever reached via `kubectl port-forward` from the eks-admin
+# bastion (see docs/ARCHITECTURE-AND-MONITORING.md, "Cluster access path"),
+# which forwards directly into the pod's network namespace and bypasses
+# normal pod-to-pod NetworkPolicy enforcement. Nothing else in-cluster needs
+# to reach Kibana, so ingress is fully denied.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kibana
+  namespace: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: kibana
+  policyTypes:
+    - Ingress
+  ingress: []

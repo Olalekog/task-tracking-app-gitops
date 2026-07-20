@@ -1,10 +1,23 @@
-﻿apiVersion: apps/v1
+﻿apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: monitoring
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: grafana
   namespace: monitoring
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: grafana
@@ -40,6 +53,15 @@ spec:
               mountPath: /etc/grafana/provisioning/dashboards
             - name: dashboard-backend
               mountPath: /var/lib/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
       volumes:
         - name: datasources
           configMap:
@@ -50,3 +72,6 @@ spec:
         - name: dashboard-backend
           configMap:
             name: grafana-dashboard-backend
+        - name: data
+          persistentVolumeClaim:
+            claimName: grafana-data
