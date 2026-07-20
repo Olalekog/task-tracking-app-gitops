@@ -5,7 +5,27 @@ observability stack (metrics + logs) is integrated with them, and exactly which
 metrics are captured. It reflects the manifests in this repository
 (`base/` and `monitoring/base/`) as deployed by Argo CD.
 
+Every section below follows the same three-part structure:
+
+- **What** — what the thing actually is/does
+- **Why** — why it exists, or why it was built this way instead of some other way
+- **How** — the concrete mechanism: which manifest, which flag, which API call
+
 ## 1. Namespaces
+
+**What:** four `base/` namespaces for the application tiers, one for Argo CD, one
+for the whole monitoring stack.
+
+**Why:** namespace-per-tier gives each component its own RBAC/NetworkPolicy
+boundary (e.g. the `exporter` MySQL user is scoped to `database`, not
+cluster-wide) and keeps `kubectl get pods -n <tier>` meaningful.
+
+**How:** defined in [`base/namespace.yaml`](../base/namespace.yaml) and
+[`monitoring/base/namespace.yaml`](../monitoring/base/namespace.yaml). Argo CD
+`Application` resources create them automatically
+(`syncOptions: CreateNamespace=true`, see
+[`applications/task-tracking-app-dev.yaml`](../applications/task-tracking-app-dev.yaml)) —
+nobody runs `kubectl create namespace` by hand.
 
 | Namespace    | Purpose                                                        |
 |--------------|-----------------------------------------------------------------|
@@ -16,12 +36,17 @@ metrics are captured. It reflects the manifests in this repository
 | `argocd-ns`  | Argo CD control plane (GitOps operator)                          |
 | `monitoring` | Prometheus, Grafana, Elasticsearch, Kibana, Fluentd               |
 
-Namespaces are defined in [`base/namespace.yaml`](../base/namespace.yaml) and
-[`monitoring/base/namespace.yaml`](../monitoring/base/namespace.yaml). Argo CD
-`Application` resources create them automatically (`syncOptions: CreateNamespace=true`,
-see [`applications/task-tracking-app-dev.yaml`](../applications/task-tracking-app-dev.yaml)).
-
 ## 2. Application architecture and request flow
+
+**What:** a standard three-tier app — React/Nginx frontend, FastAPI backend,
+MySQL database — each in its own namespace, wired together entirely through
+Kubernetes Services rather than hardcoded IPs.
+
+**Why:** namespace isolation without sacrificing simple service discovery —
+`backend` can be reached as if it were local to `frontend` without the app
+code knowing about cross-namespace DNS.
+
+**How:**
 
 ```mermaid
 flowchart LR
@@ -35,8 +60,6 @@ flowchart LR
     DBSvc --> DBPod["mysql StatefulSet (1 replica)\nMySQL 8.4 :3306"]
 ```
 
-Key points:
-
 - **Ingress → frontend**: an ALB (via the AWS Load Balancer Controller,
   `alb.ingress.kubernetes.io/*` annotations in
   [`base/ingress.yaml`](../base/ingress.yaml)) is internet-facing and routes all
@@ -44,19 +67,30 @@ Key points:
 - **frontend → backend**: the `frontend` namespace has its own `backend` Service,
   but it's an `ExternalName` Service
   ([`base/backend-external-service.yaml`](../base/backend-external-service.yaml))
-  that simply resolves to `backend.backend.svc.cluster.local:8000`. This lets the
-  frontend container reference `backend` as if it were local without a cross-namespace
-  DNS lookup baked into app config — the redirection is handled entirely at the
-  Kubernetes DNS layer.
+  that simply resolves to `backend.backend.svc.cluster.local:8000`. The
+  cross-namespace redirection happens entirely at the Kubernetes DNS layer, not
+  in application config.
 - **backend → database**: the backend reads `DATABASE_URL` from
   [`base/backend-secret.yaml`](../base/backend-secret.yaml), pointing at
   `mysql.database.svc.cluster.local:3306`. The `mysql` Service is headless
   (`clusterIP: None`), so this resolves directly to the StatefulSet pod's IP.
 - **Database bootstrap**: [`base/mysql-init-configmap.yaml`](../base/mysql-init-configmap.yaml)
-  seeds the `tasks` table and creates the `exporter` DB user (see §4.3) on first boot only —
-  `docker-entrypoint-initdb.d` scripts don't re-run against an existing data volume.
+  seeds the `tasks` table and creates the `exporter` DB user (§4.4) on first boot
+  only — `docker-entrypoint-initdb.d` scripts don't re-run against an existing
+  data volume.
 
 ## 3. GitOps delivery (Argo CD)
+
+**What:** each environment's cluster state is a deterministic function of this
+Git repo, continuously reconciled by Argo CD.
+
+**Why:** the alternative — someone running `kubectl apply` by hand against a
+live cluster — has no audit trail and drifts silently. With `selfHeal: true`,
+drift *cannot* silently persist: it gets reverted back to Git automatically
+(this bit us directly — see §4.1a's Kibana note, where a live `kubectl patch`
+was reverted before its matching commit landed).
+
+**How:**
 
 ```mermaid
 flowchart LR
@@ -72,16 +106,25 @@ under [`applications/`](../applications) pointing at a matching branch/overlay:
 - `overlays/<env>/kustomization.yaml` composes `base/` + `monitoring/base/` and pins
   the `task-tracking-backend`/`task-tracking-frontend` image tags to a specific ECR
   digest for that environment (see [`overlays/dev/kustomization.yaml`](../overlays/dev/kustomization.yaml)).
-- `syncPolicy.automated` has `prune: true` and `selfHeal: true` — Argo CD continuously
-  reconciles the live cluster state back to what's in Git, including monitoring
-  resources, so editing a dashboard/ConfigMap in-cluster without a matching commit
-  will be reverted on the next sync.
+- `syncPolicy.automated` has `prune: true` and `selfHeal: true` — any manual
+  `kubectl` change that diverges from Git, including to monitoring resources,
+  is reverted on the next sync (typically within a few minutes, or immediately
+  if you push and then trigger a manual sync).
 
 ## 4. Observability architecture
 
-The monitoring stack is entirely self-hosted (no managed CloudWatch/AMP/AMG) and
-lives in the `monitoring` namespace, deployed from the same Argo CD `Application`
-as the app itself (`monitoring/base` is included by every overlay).
+**What:** a fully self-hosted metrics + logging stack — Prometheus,
+Alertmanager, Grafana, Elasticsearch, Kibana, Fluentd — living entirely inside
+the `monitoring` namespace.
+
+**Why:** no managed CloudWatch/AMP/AMG dependency, so the whole stack is
+portable across clusters/accounts and versioned in the same Git history as the
+app it's observing. The tradeoff is everything (auth, storage, alerting
+delivery) has to be built explicitly rather than inherited from a managed
+service — most of the "gaps" in §6 are exactly that tradeoff surfacing.
+
+**How:** deployed from the same Argo CD `Application` as the app itself
+(`monitoring/base` is included by every overlay, §3).
 
 ```mermaid
 flowchart TB
@@ -96,8 +139,9 @@ flowchart TB
     Prom -->|"rule_files: alerts.yml"| Rules[(Alerting rules)]
     Prom -->|fires alerts| AM["Alertmanager :9093"]
     AM -->|discord_configs webhook| Discord["Discord channel"]
-    Prom --> Graf["Grafana :3000\nPVC-backed (2Gi)\nprovisioned datasource"]
-    Graf --> Dash["Dashboard: Task Tracking Backend\n(auto-provisioned JSON)"]
+    Prom --> Graf["Grafana :3000\nPVC-backed (2Gi)\nprovisioned datasources"]
+    Graf --> DashBE["Dashboard: Task Tracking Backend"]
+    Graf --> DashDisk["Dashboard: Node Disk I/O"]
 
     subgraph Logs collection
         FluentdDS["Fluentd DaemonSet\n(1 pod per node)"] -->|"tails /var/log\non every node, authenticated"| ES["Elasticsearch 8.17.0 :9200\nsingle-node, xpack.security on\nPVC-backed (20Gi)"]
@@ -107,8 +151,17 @@ flowchart TB
 
 ### 4.1 Metrics collection — Prometheus service discovery
 
-Prometheus uses **Kubernetes pod-based service discovery**, not static targets
-([`monitoring/base/prometheus-configmap.yaml`](../monitoring/base/prometheus-configmap.yaml)):
+**What:** Prometheus discovers *what* to scrape from the Kubernetes API itself,
+not from a static, manually-maintained target list.
+
+**Why:** a static target list rots — every new workload needs a matching config
+change or it's silently unmonitored. Annotation-based discovery makes
+"opt into monitoring" a one-line addition to any Deployment's pod template,
+with no Prometheus-side change required.
+
+**How:**
+[`monitoring/base/prometheus-configmap.yaml`](../monitoring/base/prometheus-configmap.yaml)
+runs a `role: pod` Kubernetes service discovery job:
 
 ```yaml
 scrape_configs:
@@ -119,18 +172,23 @@ scrape_configs:
       - keep pods where prometheus.io/scrape: "true"
       - rewrite __address__ to <pod_ip>:<prometheus.io/port>
       - rewrite __metrics_path__ to prometheus.io/path
+      - copy __meta_kubernetes_namespace/_pod_name/_pod_container_name
+        to kubernetes_namespace/kubernetes_pod_name/kubernetes_container_name
+        (so alert rules and dashboards can filter/group by them)
 ```
 
-Any pod in the cluster is scraped automatically if it carries these three
-annotations — no manual target list to maintain. Two more scrape jobs cover what
-annotation-based pod discovery can't reach (see §4.7): `kubernetes-nodes-cadvisor`
-(container-level CPU/memory/network/disk, proxied through each node's kubelet) and
-the annotated `kube-state-metrics`/`node-exporter` pods themselves. RBAC for all of
-this is granted via a dedicated `prometheus` ServiceAccount + ClusterRole
-([`monitoring/base/rbac.yaml`](../monitoring/base/rbac.yaml)) allowing `get/list/watch`
-on `nodes`, `nodes/proxy`, `services`, `endpoints`, `pods`, and `ingresses`
-cluster-wide — `nodes/proxy` is what lets Prometheus reach each kubelet's
-`/metrics/cadvisor` endpoint.
+Any pod carrying those three annotations gets scraped automatically. Two more
+scrape jobs cover what annotation-based pod discovery structurally can't reach
+(see §4.7): `kubernetes-nodes-cadvisor` (container-level CPU/memory/network/disk,
+proxied through each node's kubelet) and the annotated
+`kube-state-metrics`/`node-exporter` pods themselves, which *are* reached via
+the normal pod-annotation path since they're just pods too.
+
+RBAC for all of this is a dedicated `prometheus` ServiceAccount + ClusterRole
+([`monitoring/base/rbac.yaml`](../monitoring/base/rbac.yaml)) allowing
+`get/list/watch` on `nodes`, `nodes/proxy`, `services`, `endpoints`, `pods`,
+and `ingresses` cluster-wide — `nodes/proxy` specifically is what lets
+Prometheus reach each kubelet's `/metrics/cadvisor` endpoint.
 
 Every workload that wants to be scraped sets the annotations on its **pod template**:
 
@@ -145,19 +203,42 @@ Every workload that wants to be scraped sets the annotations on its **pod templa
 Prometheus runs as a single Deployment
 ([`monitoring/base/prometheus-deployment.yaml`](../monitoring/base/prometheus-deployment.yaml))
 backed by a **10Gi PVC** mounted at `/prometheus` (`--storage.tsdb.path=/prometheus`),
-so collected time series now survive pod restarts — the Deployment uses
+so collected time series survive pod restarts — the Deployment uses
 `strategy: Recreate` since a `ReadWriteOnce` volume can't attach to two pods at
 once during a rollout. It also mounts a `prometheus-rules` ConfigMap
 (`rule_files: /etc/prometheus/rules/*.yml`) and is configured with an
 `alerting.alertmanagers` target pointing at the `alertmanager` Service — see §4.1a.
 
+> **Operational note learned live:** Prometheus doesn't watch mounted rule/config
+> files for changes — it only re-reads them at process start (or via
+> `--web.enable-lifecycle`'s `/-/reload`, not enabled here). A ConfigMap edit
+> alone isn't enough; `kubectl rollout restart deployment/prometheus` (or an
+> equivalent pod replacement) is required after any `prometheus-rules-configmap.yaml`
+> or `prometheus-configmap.yaml` change actually lands on disk.
+
 ### 4.1a Alerting — Prometheus rules + Alertmanager → Discord
 
+**What:** a set of Prometheus alerting rules, evaluated continuously, that fire
+into Alertmanager, which groups/dedupes them and posts to a Discord channel.
+
+**Why:** dashboards are pull-based — someone has to be looking at them.
+Alerting is push-based: the system tells you when something's actually wrong,
+so Grafana/Prometheus don't need to be open in a tab 24/7. Discord specifically
+because it's a real, verified-working delivery channel with zero extra
+infrastructure (no relay service needed — Alertmanager speaks it natively).
+
+**How:**
 [`monitoring/base/prometheus-rules-configmap.yaml`](../monitoring/base/prometheus-rules-configmap.yaml)
-defines the alerting rules Prometheus evaluates continuously; on a breach it pushes
-the alert to [`monitoring/base/alertmanager-deployment.yaml`](../monitoring/base/alertmanager-deployment.yaml),
-a single-replica Alertmanager (`prom/alertmanager:v0.27.0`, Service on `:9093`)
-which handles grouping/dedup and routes to Discord.
+defines the rules; [`monitoring/base/alertmanager-deployment.yaml`](../monitoring/base/alertmanager-deployment.yaml)
+runs a single-replica Alertmanager (`prom/alertmanager:v0.27.0`, Service on
+`:9093`) that routes to Discord via its native `discord_configs` receiver
+(supported since Alertmanager v0.25 — no separate webhook relay needed).
+`alertmanager-config` is a **Secret**, not a ConfigMap — the webhook URL is a
+bearer credential, same reasoning as any other credential in this repo — and
+`send_resolved: true` means Discord also gets a follow-up message when an
+alert clears, not just when it fires. Verified end-to-end by posting synthetic
+alerts directly to Alertmanager's `/api/v2/alerts` API and confirming Discord
+delivery.
 
 | Alert | Fires when | Why it matters | Severity |
 |---|---|---|---|
@@ -170,19 +251,35 @@ which handles grouping/dedup and routes to Discord.
 | `NodeHighCPU` | Node CPU utilization > 85% for 15m | Sustained (not spiky) CPU pressure — a precursor to pod scheduling/throttling problems | warning |
 | `NodeLowMemory` | Node available memory < 10% of total for 15m | Precursor to the kernel OOM-killer picking off pods on that node | warning |
 | `NodeDiskSpaceLow` | A node filesystem has < 10% free for 15m | Kubelet starts evicting pods well before a disk actually fills to 100% | warning |
+| `NodeDiskIOSaturation` | A disk device is busy servicing I/O >90% of the time for 15m | `NodeDiskSpaceLow` only covers *capacity* — a disk can have plenty of free space and still be the bottleneck if it's saturated with reads/writes (queueing). This is the throughput/latency counterpart, added alongside the Node Disk I/O dashboard (§4.5) | warning |
 
-**Discord delivery**: `alertmanager-config` is a Secret (not a ConfigMap — the
-webhook URL is a bearer credential, same reasoning as any other credential in
-this repo) holding `alertmanager.yml` with a `discord` receiver using
-Alertmanager's native `discord_configs` (supported since Alertmanager v0.25,
-no separate relay needed). `send_resolved: true` means Discord also gets a
-follow-up message when an alert clears, not just when it fires. Verified
-working end-to-end by posting synthetic alerts directly to Alertmanager's
-`/api/v2/alerts` API and confirming delivery.
+**Two real bugs were found live while building this, both instructive:**
+
+1. **`PodNotReady` false-positive**: the completed `elastic-bootstrap-kibana-user`
+   Job pod fired this alert continuously, since a finished pod is permanently
+   "not ready." Fixed by restricting the rule to `phase="Running"` and adding
+   `ttlSecondsAfterFinished: 300` to the Job so its pod cleans itself up
+   (§4.6's Kibana note).
+2. **Direct `kubectl patch` reverted by `selfHeal`**: enabling Alertmanager
+   debug logging via a live `kubectl patch` (to diagnose why a test alert
+   wasn't reaching Discord) was silently undone by Argo CD's `selfHeal` within
+   about a minute, because the patch wasn't reflected in Git. Any live cluster
+   change here is temporary unless it's also committed — see §3.
 
 ### 4.2 Backend metrics (FastAPI)
 
-Instrumented in [`task-tracking-app/backend/app/main.py`](../../task-tracking-app/backend/app/main.py):
+**What:** HTTP-level metrics (traffic, latency, payload size) captured
+automatically by a middleware library, plus three hand-written counters for
+domain events the generic HTTP layer has no way to know about.
+
+**Why:** `prometheus-fastapi-instrumentator` gets full request-level
+observability with zero per-route code — every endpoint is measured the same
+way. The custom counters exist because "a `PATCH /tasks/1` request completed
+with 200" doesn't tell you whether a task was *actually* updated (it could be a
+no-op) — only the handler itself knows that.
+
+**How:** instrumented in
+[`task-tracking-app/backend/app/main.py`](../../task-tracking-app/backend/app/main.py):
 
 ```python
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
@@ -193,12 +290,10 @@ tasks_deleted_total = Counter("task_tracking_tasks_deleted_total", "Tasks delete
 ```
 
 Calling `Instrumentator().instrument(app)` with no explicit `.add(...)` calls
-registers the library's bundled **default** metric set — request counting,
-latency, and payload size, all wired into FastAPI's middleware so every request
-is measured with no per-route code needed. On top of that, three custom
-`Counter`s track domain-specific events the generic HTTP instrumentation has no
-way to know about (a `PATCH` could be a no-op update or a real one; only the
-handler itself knows a task was actually created/updated/deleted).
+registers the library's bundled **default** metric set. The three custom
+`Counter`s are incremented explicitly inside each handler, *after* the DB
+commit succeeds — so they only count changes that actually persisted, not
+requests that merely arrived.
 
 | Metric | Type | What it actually measures | Why you'd look at it |
 |---|---|---|---|
@@ -207,7 +302,7 @@ handler itself knows a task was actually created/updated/deleted).
 | `http_request_duration_highr_seconds_bucket` | histogram | The same latency measurement, but with finer-grained buckets and **without** the `handler` label | Trades per-route breakdown for bucket precision — used for an accurate **overall p99** (§4.5's dashboard), since fine buckets need low cardinality to stay cheap to store |
 | `http_request_size_bytes` | summary | Size of the request body Prometheus received | Rarely alerted on, but flags e.g. a client suddenly sending unexpectedly large payloads |
 | `http_response_size_bytes` | summary | Size of the response body sent back | Same use case in reverse — catches responses ballooning (e.g. `GET /tasks` growing unbounded as the table grows, with no pagination) |
-| `task_tracking_tasks_created_total` | counter | Incremented once per successful `POST /tasks` / `POST /api/tasks` — *after* the DB commit succeeds, so it only counts tasks that actually persisted | Real usage/business metric — how many tasks are actually being created, independent of how many `POST` requests came in (some may 4xx/5xx and never reach the increment) |
+| `task_tracking_tasks_created_total` | counter | Incremented once per successful `POST /tasks` / `POST /api/tasks` — *after* the DB commit succeeds | Real usage/business metric — how many tasks are actually being created, independent of how many `POST` requests came in (some may 4xx/5xx and never reach the increment) |
 | `task_tracking_tasks_updated_total` | counter | Same, for `PATCH /tasks/{id}` after commit | Task-editing activity over time |
 | `task_tracking_tasks_deleted_total` | counter | Same, for `DELETE /tasks/{id}` after commit | Task-deletion activity — a sudden spike here alongside no corresponding creates could flag a bug or bulk-delete incident |
 | `process_resident_memory_bytes` | gauge | The backend process's RSS (physical memory actually in RAM, not just allocated) at scrape time, from the Python client's built-in process collector | Memory leak detection — a steady upward trend with no corresponding traffic growth is the classic leak signature |
@@ -219,12 +314,18 @@ the Deployment's `readinessProbe`/`livenessProbe` — it is not a Prometheus met
 
 ### 4.3 Frontend metrics (nginx-exporter)
 
-The `nginx-exporter` sidecar (`nginx/nginx-prometheus-exporter`) scrapes nginx's
-built-in `/stub_status` page on `127.0.0.1:8080` (nginx's own lightweight status
-endpoint, not a Prometheus format) and translates it into Prometheus metrics on
-`:9113`. It only sees **connection-level** activity — TCP-level facts about
-nginx's own worker processes — it has no idea what a "task" or a "route" is;
-that's only observable at the backend (§4.2).
+**What:** connection-level metrics about nginx itself (how many connections are
+open, reading, writing, waiting) — not anything about the application routes
+behind it.
+
+**Why:** nginx's built-in `/stub_status` page isn't in Prometheus format, and
+it's only reachable from inside the pod (`127.0.0.1:8080`) — the sidecar
+exists purely to translate and re-expose it externally on `:9113` where
+Prometheus can reach it.
+
+**How:** `nginx-exporter` (`nginx/nginx-prometheus-exporter`) scrapes
+`/stub_status` and re-exposes it. It has no idea what a "task" or a "route"
+is — that's only observable at the backend (§4.2).
 
 | Metric | Type | What it actually measures | Why you'd look at it |
 |---|---|---|---|
@@ -236,13 +337,20 @@ that's only observable at the backend (§4.2).
 
 ### 4.4 Database metrics (mysqld-exporter)
 
-`mysqld-exporter` connects to MySQL as a scoped `exporter` user granted only
-`PROCESS`, `REPLICATION CLIENT`, and `SELECT ON performance_schema.*`
-(created via [`base/mysql-init-configmap.yaml`](../base/mysql-init-configmap.yaml)) —
+**What:** MySQL's own internal status counters and variables
+(`SHOW GLOBAL STATUS`/`SHOW GLOBAL VARIABLES`/`performance_schema`), re-exposed
+as Prometheus metrics.
+
+**Why:** the backend can *feel* slow without it being obvious whether the API,
+the network, or the database is the actual bottleneck — these metrics are what
+let you attribute a slowdown to "the DB" specifically rather than guessing.
+
+**How:** `mysqld-exporter` connects to MySQL as a scoped `exporter` user
+granted only `PROCESS`, `REPLICATION CLIENT`, and
+`SELECT ON performance_schema.*` (created via
+[`base/mysql-init-configmap.yaml`](../base/mysql-init-configmap.yaml)) —
 deliberately not a superuser, since the exporter only needs to *read* server
-status, never touch application data. It exposes MySQL's own internal status
-counters (`SHOW GLOBAL STATUS`, `SHOW GLOBAL VARIABLES`, and `performance_schema`
-tables) as Prometheus metrics on `:9104`.
+status, never touch application data.
 
 | Metric | Type | What it actually measures | Why you'd look at it |
 |---|---|---|---|
@@ -255,15 +363,32 @@ tables) as Prometheus metrics on `:9104`.
 
 ### 4.5 Grafana
 
+**What:** the visualization layer on top of Prometheus, with two dashboards —
+one for the application, one for node-level disk I/O.
+
+**Why:** raw PromQL queries in Prometheus's own UI are fine for ad-hoc
+debugging but useless for "what does normal look like at a glance." Grafana's
+dashboards are the answer to that, and everything about them is
+version-controlled and auto-provisioned rather than clicked together by hand
+(and lost on the next pod restart).
+
+**How:**
 [`monitoring/base/grafana-provisioning-configmap.yaml`](../monitoring/base/grafana-provisioning-configmap.yaml)
-auto-provisions everything at pod startup — nothing needs to be configured by hand:
+auto-provisions the datasource and dashboard *provider* at pod startup;
+dashboard JSON is provisioned from separate ConfigMaps mounted under
+`/var/lib/grafana/dashboards` (Grafana's file provisioner scans this path
+recursively, so a second dashboard can live in its own ConfigMap mounted at a
+subdirectory without conflicting with the first — confirmed working via
+Grafana's `/api/search`, which lists both).
 
 - **Datasource**: `Prometheus`, pointed at `http://prometheus.monitoring.svc.cluster.local:9090`,
-  marked `isDefault: true` and `editable: false` (locked — changes must go through Git).
-- **Dashboard provider**: loads any JSON dropped into `/var/lib/grafana/dashboards`.
-- **Dashboard**: `Task Tracking Backend` (uid `task-tracking-backend`), defined in
-  [`monitoring/base/grafana-dashboard-backend-configmap.yaml`](../monitoring/base/grafana-dashboard-backend-configmap.yaml),
-  with panels grouped into three rows:
+  marked `isDefault: true` and `editable: false` (locked — changes must go
+  through Git, per §3).
+- **Dashboard provider**: loads any JSON dropped anywhere under
+  `/var/lib/grafana/dashboards`.
+- **Dashboard 1 — `Task Tracking Backend`** (uid `task-tracking-backend`),
+  from [`monitoring/base/grafana-dashboard-backend-configmap.yaml`](../monitoring/base/grafana-dashboard-backend-configmap.yaml),
+  mounted at `/var/lib/grafana/dashboards`:
 
   | Row | Panels | Query basis |
   |---|---|---|
@@ -271,23 +396,48 @@ auto-provisions everything at pod startup — nothing needs to be configured by 
   | Application Metrics | Tasks created / updated / deleted (stat panels) · Task mutation rate (timeseries) | `task_tracking_tasks_{created,updated,deleted}_total` |
   | Process Health | Resident memory by pod · CPU usage by pod · Open file descriptors by pod | `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_open_fds` |
 
-  Grafana is backed by a **2Gi PVC** mounted at `/var/lib/grafana`
-  (`strategy: Recreate`, same reasoning as Prometheus), so the admin password
-  (`GF_SECURITY_ADMIN_PASSWORD=admin` in
-  [`monitoring/base/grafana-deployment.yaml`](../monitoring/base/grafana-deployment.yaml)
-  — only takes effect on first boot with an empty data volume), any manually-added
-  dashboards, and Grafana's own SQLite state now survive pod restarts.
+- **Dashboard 2 — `Node Disk I/O`** (uid `node-disk-io`), from
+  [`monitoring/base/grafana-dashboard-node-configmap.yaml`](../monitoring/base/grafana-dashboard-node-configmap.yaml),
+  mounted at `/var/lib/grafana/dashboards/node`. Kept as a **separate**
+  dashboard/ConfigMap rather than a row bolted onto the backend one, since
+  disk I/O is node-level infrastructure, not scoped to this one application:
+
+  | Panel | Query basis |
+  |---|---|
+  | Disk read/write throughput | `rate(node_disk_read_bytes_total[...])`, `rate(node_disk_written_bytes_total[...])` |
+  | Disk I/O saturation (% time busy) | `rate(node_disk_io_time_seconds_total[...])` — same signal `NodeDiskIOSaturation` (§4.1a) alerts on |
+  | Disk IOPS | `rate(node_disk_reads_completed_total[...])`, `rate(node_disk_writes_completed_total[...])` |
+
+Grafana is backed by a **2Gi PVC** mounted at `/var/lib/grafana`
+(`strategy: Recreate`, same reasoning as Prometheus), so any manually-added
+dashboards/users and Grafana's own SQLite state survive pod restarts.
+
+> **Operational note learned live:** `GF_SECURITY_ADMIN_PASSWORD=admin` only
+> sets the password on a genuinely *empty* data volume — once the PVC has
+> initialized, later pod restarts don't re-apply it, even though the env var
+> is still set. If the admin password ever seems wrong, it's not this env var
+> lying; use `grafana-cli admin reset-admin-password <new>` inside the pod to
+> force it (this is how the current `admin`/`admin` was confirmed working).
 
 ### 4.6 Logs collection — Fluentd → Elasticsearch → Kibana
+
+**What:** every container's stdout/stderr, tailed from each node and shipped
+into a searchable Elasticsearch index, browsable through Kibana.
+
+**Why:** Prometheus answers "is something wrong" (metrics); logs answer "what
+exactly happened" once you know where to look. Centralizing them means you
+don't need `kubectl logs` access to every node to debug an incident.
+
+**How:**
 
 - **Fluentd** runs as a DaemonSet (one pod per node,
   [`monitoring/base/fluentd-daemonset.yaml`](../monitoring/base/fluentd-daemonset.yaml)),
   mounting each node's `/var/log` as a hostPath and shipping everything to
   `elasticsearch.monitoring.svc.cluster.local:9200`, authenticating as `elastic`
   (`FLUENT_ELASTICSEARCH_USER`/`_PASSWORD`, sourced from the `elastic-credentials`
-  Secret — see below). It runs with a dedicated `fluentd` ServiceAccount +
-  ClusterRole granting `get/list/watch` on `pods` and `namespaces` (used to enrich
-  log records with Kubernetes metadata).
+  Secret). It runs with a dedicated `fluentd` ServiceAccount + ClusterRole
+  granting `get/list/watch` on `pods` and `namespaces` (used to enrich log
+  records with Kubernetes metadata).
 - **Elasticsearch** is a single-node StatefulSet
   ([`monitoring/base/elastic-kibana.yaml`](../monitoring/base/elastic-kibana.yaml))
   with a 20Gi PVC for data. `xpack.security.enabled: "true"`, with HTTP/transport
@@ -296,40 +446,48 @@ auto-provisions everything at pod startup — nothing needs to be configured by 
   cert-management story in a static-manifest setup. The bootstrap password for the
   `elastic` superuser comes from
   [`monitoring/base/elastic-secret.yaml`](../monitoring/base/elastic-secret.yaml)
-  (`ELASTIC_PASSWORD`, placeholder value — follows the same `change-me` convention
-  as `base/mysql-secret.yaml`/`base/backend-secret.yaml`; rotate it before any
-  real use). Ingress to Elasticsearch is restricted by a NetworkPolicy
-  ([`monitoring/base/networkpolicy.yaml`](../monitoring/base/networkpolicy.yaml))
+  (placeholder value, same `change-me` convention as `base/mysql-secret.yaml`/
+  `base/backend-secret.yaml`; rotate before real use). Ingress is restricted by
+  a NetworkPolicy ([`monitoring/base/networkpolicy.yaml`](../monitoring/base/networkpolicy.yaml))
   to only the `kibana` and `fluentd` pods, on port 9200.
 - **Kibana** authenticates to Elasticsearch as the built-in `kibana_system`
-  account — **not** the `elastic` superuser. This was a real bug found live:
-  Kibana 8.x hard-rejects `elastic` as its own configured username at startup
-  (`config validation ... "elastic" is forbidden`, not just a permissions
-  complaint) and crash-loops. `kibana_system`'s password isn't settable via an
-  env var the way `ELASTIC_PASSWORD` is, so
-  [`monitoring/base/elastic-bootstrap-job.yaml`](../monitoring/base/elastic-bootstrap-job.yaml)
-  is a one-time Kubernetes `Job` that waits for Elasticsearch to be reachable,
-  then calls its `_security/user/kibana_system/_password` API (authenticating as
-  `elastic`) to set it. `ttlSecondsAfterFinished: 300` cleans the completed Job
-  pod up automatically — without it, `kube_pod_status_ready` reports the
-  finished pod as permanently "not ready," which was itself a second bug found
-  live (§4.1a's `PodNotReady` note). Kibana itself has no inbound NetworkPolicy
-  allowances (`ingress: []`, fully closed) since it's only ever reached via
-  `kubectl port-forward` from the `eks-admin` bastion (§5), which bypasses
-  normal pod-network policy enforcement. No index patterns or saved dashboards
-  are pre-provisioned — those would need to be created manually in the Kibana UI.
+  account — **not** the `elastic` superuser.
+
+  > **Real bug found and fixed live:** Kibana 8.x hard-rejects `elastic` as its
+  > own configured username at startup (`config validation ... "elastic" is
+  > forbidden`, a deliberate validation check, not just a permissions
+  > complaint) and crash-loops. `kibana_system`'s password isn't settable via
+  > an env var the way `ELASTIC_PASSWORD` is, so
+  > [`monitoring/base/elastic-bootstrap-job.yaml`](../monitoring/base/elastic-bootstrap-job.yaml)
+  > is a one-time Kubernetes `Job` that waits for Elasticsearch to be
+  > reachable, then calls its `_security/user/kibana_system/_password` API
+  > (authenticating as `elastic`) to set it. `ttlSecondsAfterFinished: 300`
+  > cleans the completed Job pod up automatically — without it, the finished
+  > pod is reported as permanently "not ready" by `kube_pod_status_ready`,
+  > which was itself the second bug found live (§4.1a's `PodNotReady` note).
+
+  Kibana itself has no inbound NetworkPolicy allowances (`ingress: []`, fully
+  closed) since it's only ever reached via `kubectl port-forward` from the
+  `eks-admin` bastion (§5), which bypasses normal pod-network policy
+  enforcement. No index patterns or saved dashboards are pre-provisioned —
+  those would need to be created manually in the Kibana UI.
 
 ### 4.7 Node & container-level metrics
 
-Beyond what each application/exporter chooses to expose on its own `/metrics`,
-three more sources give Kubernetes resource-level visibility — the difference
-between them is *where* the data comes from: the Kubernetes API server itself
-(object state), each node's kernel (`/proc`/`/sys`), or each node's container
-runtime (per-container cgroup accounting):
+**What:** three independent sources of resource-level visibility beyond
+per-app `/metrics` endpoints — each answering a different question because
+each reads from a different place.
+
+**Why:** without these, you can see "the backend is slow" (§4.2) but not
+"because the node it's on is out of memory" or "because another pod on the
+same node is starving it of CPU." Attribution requires node- and
+container-level data, not just app-level data.
+
+**How:**
 
 | Source | Deployed as | What it actually measures |
 |---|---|---|
-| [`kube-state-metrics`](../monitoring/base/kube-state-metrics.yaml) | Deployment, own ClusterRole (read-only on pods/nodes/deployments/statefulsets/jobs/etc.) | Kubernetes **object state** — what the API server reports, not real resource usage |
+| [`kube-state-metrics`](../monitoring/base/kube-state-metrics.yaml) | Deployment, own ClusterRole (read-only on pods/nodes/deployments/statefulsets/jobs/etc.) | Kubernetes **object state**, read from the API server — what Kubernetes *thinks* is true, not real resource usage |
 | [`node-exporter`](../monitoring/base/node-exporter.yaml) | DaemonSet, `hostNetwork`/`hostPID`, read-only hostPath mounts of `/proc`, `/sys`, `/` | **Host-level** OS metrics, read directly from the kernel |
 | cAdvisor (built into every kubelet, no separate deployment) | Prometheus job `kubernetes-nodes-cadvisor`, scraped via the API server's node proxy (`/api/v1/nodes/<node>/proxy/metrics/cadvisor`), authenticated with Prometheus's own service account token | **Per-container** resource usage, attributed to individual pods/containers via cgroups |
 
@@ -349,6 +507,9 @@ runtime (per-container cgroup accounting):
 | `node_cpu_seconds_total{mode}` | Cumulative CPU time per core per mode (`idle`, `user`, `system`, `iowait`, ...) | `NodeHighCPU`'s `100 - (rate(...{mode="idle"}) * 100)` derives utilization from idle time — standard node-exporter idiom |
 | `node_memory_MemAvailable_bytes` | Kernel's own estimate of memory available for new workloads (accounts for reclaimable cache, unlike raw "free") | What `NodeLowMemory` alerts on — a more accurate OOM predictor than `MemFree` alone |
 | `node_filesystem_avail_bytes` / `_size_bytes` | Free vs. total space per mounted filesystem | `NodeDiskSpaceLow`'s ratio — note the alert excludes `tmpfs`/`overlay` filesystems to avoid noise from ephemeral/container-layer mounts |
+| `node_disk_read_bytes_total` / `_written_bytes_total` | Cumulative bytes read/written per physical disk device | Disk throughput — see §4.5's "Node Disk I/O" dashboard |
+| `node_disk_io_time_seconds_total` | Cumulative wall-clock time the device had at least one I/O in flight | `rate()` of this is the fraction of time the disk was busy (0-1) — what `NodeDiskIOSaturation` (§4.1a) alerts on; a disk can be nowhere near full and still be *this* kind of bottleneck |
+| `node_disk_reads_completed_total` / `_writes_completed_total` | Cumulative count of completed I/O operations | `rate()` gives IOPS — useful alongside throughput, since a workload can be IOPS-bound (many small ops) rather than bandwidth-bound |
 | `node_network_receive_bytes_total` / `_transmit_bytes_total` | Cumulative bytes in/out per network interface | Not alerted on here, but `rate()` gives node-level network throughput — useful for spotting a node saturating its ENI bandwidth |
 
 **cAdvisor** — per-container resource usage (the granularity node-exporter can't
@@ -361,19 +522,26 @@ is responsible for it):
 | `container_memory_working_set_bytes` | The memory the kernel considers "in active use" by that container — this is what the OOM-killer and Kubernetes' own eviction logic actually watch, not `container_memory_usage_bytes` (which also counts easily-reclaimable page cache) | The right metric to compare against a container's `resources.limits.memory` to predict an OOMKill before it happens |
 | `container_network_receive_bytes_total` / `_transmit_bytes_total` | Bytes in/out per container's network namespace | Per-pod network usage, e.g. spotting one backend replica handling disproportionate traffic behind the Service's load-balancing |
 | `container_fs_usage_bytes` | Writable-layer disk usage per container | Catches a container writing unexpectedly large amounts to its ephemeral filesystem (logs, temp files) |
+| `container_fs_reads_bytes_total` / `_writes_bytes_total` | Per-container disk I/O throughput | The per-container breakdown of what `node_disk_*` shows at the host level — attributes disk I/O to a specific pod instead of just "the node" |
 
 Together these feed the `PodCrashLooping`, `PodNotReady`, `NodeHighCPU`,
-`NodeLowMemory`, and `NodeDiskSpaceLow` alert rules (§4.1a). No Grafana
-dashboard panels consume them yet — only the `Task Tracking Backend` dashboard
-(§4.5) exists; building a node/cluster-resource dashboard from these metrics is
-straightforward but not done here.
+`NodeLowMemory`, `NodeDiskSpaceLow`, and `NodeDiskIOSaturation` alert rules
+(§4.1a), and the `Node Disk I/O` Grafana dashboard (§4.5). There's no
+Grafana dashboard yet for the broader CPU/memory/pod-restart metrics in this
+section beyond disk I/O — building one from these is straightforward but not
+done here.
 
 ## 5. Cluster access path (how you actually reach any of this)
 
-None of the above Services are exposed outside the cluster (no Ingress, no
-LoadBalancer type) except the application itself via the ALB. The EKS API
-endpoint for this cluster is **private**, so operational access goes through a
-dedicated bastion:
+**What:** every monitoring/GitOps UI (Grafana, Prometheus, Kibana, ArgoCD) is
+reached through a single bastion instance, not exposed directly.
+
+**Why:** the EKS API endpoint for this cluster is **private**, and none of
+these Services have an Ingress or LoadBalancer — the only thing in the VPC set
+up to reach them is a dedicated, SSM-managed instance with no SSH/public IP at
+all, minimizing what's actually exposed to the internet.
+
+**How:**
 
 ```mermaid
 flowchart LR
@@ -384,21 +552,23 @@ flowchart LR
 - The `eks-admin` instance is provisioned by the
   [`eks-admin` Terraform module](../../task-tracking-app/infra/terraform/modules/eks-admin)
   with an SSM association that installs `kubectl`/`helm` and runs
-  `aws eks update-kubeconfig` at boot — it's the only thing in the VPC set up to
-  talk to the private EKS API.
-- Reaching a UI (Grafana, Prometheus, Kibana, ArgoCD) is a double hop:
-  `kubectl port-forward` on the instance, tunneled to your machine via
-  `aws ssm start-session --document-name AWS-StartPortForwardingSession`.
+  `aws eks update-kubeconfig` at boot.
+- Reaching a UI is a double hop: `kubectl port-forward` running on the
+  instance, tunneled to your machine via
+  `aws ssm start-session --document-name AWS-StartPortForwardingSession`. Both
+  hops are independent processes that can die separately (SSM sessions
+  time out, `kubectl port-forward` drops on any connection hiccup) — a "page
+  won't load" symptom is almost always one of these needing a restart, not
+  the underlying service being unhealthy.
 - **ArgoCD-specific note**: `argocd-server` in this deployment is configured with
   `server.insecure: "true"` (in its `argocd-cmd-params-cm` ConfigMap), so it serves
   plain HTTP, not TLS — connect via `http://`, not `https://`, on its forwarded port.
 
 ## 6. Notable gaps
 
-The four gaps below were identified in an earlier revision of this document and
-have since been closed in the manifests (§4.1a, §4.5, §4.6, §4.7). A couple of
-honest simplifications were made closing them — called out explicitly rather
-than glossed over:
+The gaps below were identified in an earlier revision of this document and have
+since been closed in the manifests. A couple of honest simplifications were
+made closing them — called out explicitly rather than glossed over:
 
 - ~~No Alertmanager or alerting rules~~ — **fully closed** (§4.1a): alerting
   rules, Alertmanager, and a real Discord receiver (`discord_configs`, native
@@ -421,5 +591,7 @@ than glossed over:
 - ~~No cAdvisor/node-level metrics~~ — **fixed** (§4.7): `node-exporter`
   (host CPU/memory/disk/network), `kube-state-metrics` (Kubernetes object
   state), and a cAdvisor scrape job (per-container resource usage) are all
-  wired in. No Grafana dashboard consumes them yet, though — only the
-  `Task Tracking Backend` dashboard exists (§4.5).
+  wired in, and disk I/O specifically now has both an alert (`NodeDiskIOSaturation`,
+  §4.1a) and a dashboard (`Node Disk I/O`, §4.5). The broader CPU/memory/pod-restart
+  metrics from this section still have no dedicated Grafana dashboard — only
+  disk I/O and the app-scoped `Task Tracking Backend` dashboard exist.
