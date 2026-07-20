@@ -177,7 +177,13 @@ spec:
                   req = urllib.request.Request(
                       os.environ["DISCORD_WEBHOOK_URL"],
                       data=payload,
-                      headers={"Content-Type": "application/json"},
+                      # Discord/Cloudflare returns 403 for Python's default
+                      # "Python-urllib/3.x" User-Agent (found live) — this
+                      # exact webhook URL already works fine from curl.
+                      headers={
+                          "Content-Type": "application/json",
+                          "User-Agent": "curl/8.11.0",
+                      },
                       method="POST",
                   )
                   urllib.request.urlopen(req)
