@@ -147,6 +147,10 @@ flowchart TB
         FluentdDS["Fluentd DaemonSet\n(1 pod per node)"] -->|"tails /var/log\non every node, authenticated"| ES["Elasticsearch 8.17.0 :9200\nsingle-node, xpack.security on\nPVC-backed (20Gi)"]
     end
     ES --> Kib["Kibana :5601\n(kibana_system account)"]
+
+    K8sGPT["k8sgpt-scan CronJob\n(every 15m)"] -->|"scans cluster via own ClusterRole"| API["Kubernetes API"]
+    K8sGPT -->|"--explain, via Claude"| Anthropic["Anthropic API"]
+    K8sGPT -->|"only if problems found"| Discord
 ```
 
 ### 4.1 Metrics collection — Prometheus service discovery
@@ -530,6 +534,73 @@ Together these feed the `PodCrashLooping`, `PodNotReady`, `NodeHighCPU`,
 Grafana dashboard yet for the broader CPU/memory/pod-restart metrics in this
 section beyond disk I/O — building one from these is straightforward but not
 done here.
+
+### 4.8 AI-powered cluster diagnostics (k8sgpt)
+
+**What:** a CronJob that periodically scans the whole cluster for problems
+(crash loops, failed probes, misconfigured resources, unschedulable pods,
+etc.) and uses Claude to explain each one in plain English, posting the result
+to the same Discord channel as alerts — but staying silent on a clean scan.
+
+**Why:** §4.1a's alert rules only catch conditions someone thought to write a
+PromQL expression for in advance. k8sgpt instead asks an LLM to look at raw
+cluster state (the same objects `kubectl describe` would show) and reason
+about what's wrong — catching the "huh, why is this failing" class of problem
+that doesn't have a pre-written rule, at the cost of being slower and less
+precise than a targeted alert. The two are complementary, not redundant.
+
+**How:**
+[`monitoring/base/k8sgpt-cronjob.yaml`](../monitoring/base/k8sgpt-cronjob.yaml)
+runs every 15 minutes (`*/15 * * * *`), with its own `k8sgpt` ServiceAccount +
+ClusterRole (read-only on pods/deployments/services/events/nodes/etc. — the
+same breadth of access as `kube-state-metrics`, §4.7) rather than depending on
+the k8sgpt-operator (which needs its own CRDs + controller installed first;
+a plain CronJob is a much smaller footprint for what's needed here, and this
+repo doesn't use Helm for the app/monitoring stack). Each run:
+
+1. An **init container** (`alpine`) downloads the `k8sgpt` binary at runtime,
+   authenticates it against Claude (`k8sgpt auth add --backend anthropic`),
+   and runs `k8sgpt analyze --explain`, writing the output to a shared
+   `emptyDir` volume.
+2. The **main container** (`python:3.12-alpine`) reads that output; if it's
+   empty or says "No problems detected," it exits quietly. Otherwise it builds
+   a Discord message and posts it.
+
+Credentials live in
+[`monitoring/base/k8sgpt-secret.yaml`](../monitoring/base/k8sgpt-secret.yaml):
+`DISCORD_WEBHOOK_URL` is duplicated from Alertmanager's Secret (§4.1a) since
+Alertmanager embeds its webhook inside a YAML blob rather than a standalone
+key. `ANTHROPIC_API_KEY` is a `change-me` placeholder **in Git** — GitHub's
+push protection actively blocks commits containing a recognizable Anthropic
+key pattern, so the real value is applied directly to the cluster instead of
+being committed. This is a deliberate, permanent exception to §3's "Git is the
+source of truth" rule for this one field: Argo CD will show this Secret as
+perpetually out-of-sync, and that's expected, not a bug to fix.
+
+**Three real bugs were found live building this — a useful case study in how
+much "should work" doesn't survive contact with actual container images:**
+
+1. **The official `k8sgpt` image has no shell.** It's distroless-style —
+   `sh -c "..."` failed immediately with `Init:StartError` /
+   `exec: "sh": executable file not found in $PATH`. Fixed by using `alpine`
+   as the init container instead (ships `sh`/`tar`/`wget` via busybox with no
+   `apk add` needed, so it stays compatible with the strict non-root
+   `securityContext` used throughout this repo) and downloading the k8sgpt
+   binary from its GitHub release at runtime.
+2. **Hand-rolled shell JSON escaping produced invalid JSON.** The first
+   Discord-posting attempt built the payload with `sed` (escaping quotes and
+   joining newlines) but never escaped literal backslashes or control
+   characters — Discord rejected it and `curl -f` failed with exit 22. Fixed
+   by moving JSON construction to Python's `json.dumps`, which escapes
+   correctly by construction instead of by hand.
+3. **Discord/Cloudflare blocks Python's `urllib` at the TLS layer, not just
+   the `User-Agent` header.** Even after fixing the JSON and spoofing a
+   `curl`-like `User-Agent`, `urllib.request.urlopen` still got `403
+   Forbidden` from the same webhook URL that worked fine from `curl` — a
+   fingerprinting check header-spoofing alone doesn't beat. The fix keeps
+   Python only for correctly building the JSON payload, then shells out to
+   `wget` (present via busybox, no extra install) to actually send it —
+   `wget` succeeded on the first real attempt once this was in place.
 
 ## 5. Cluster access path (how you actually reach any of this)
 
