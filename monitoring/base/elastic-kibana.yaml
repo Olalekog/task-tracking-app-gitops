@@ -114,17 +114,17 @@ spec:
           env:
             - name: ELASTICSEARCH_HOSTS
               value: http://elasticsearch:9200
-            # Using the "elastic" superuser here for simplicity, since this
-            # single static-manifest deployment has no imperative setup step
-            # to mint a scoped kibana_system service token. Swap for one if
-            # this stack graduates beyond a self-hosted dev/UAT setup.
+            # Kibana refuses to start when configured with the "elastic"
+            # superuser (a hard config-validation check, not just a
+            # permissions choice) — it requires the scoped kibana_system
+            # user instead. Its password is set by elastic-bootstrap-job.yaml.
             - name: ELASTICSEARCH_USERNAME
-              value: elastic
+              value: kibana_system
             - name: ELASTICSEARCH_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: elastic-credentials
-                  key: ELASTIC_PASSWORD
+                  key: KIBANA_SYSTEM_PASSWORD
           resources:
             requests:
               cpu: 100m

@@ -11,6 +11,7 @@ resources:
   - grafana-dashboard-backend-configmap.yaml
   - grafana-deployment.yaml
   - elastic-secret.yaml
+  - elastic-bootstrap-job.yaml
   - elastic-kibana.yaml
   - fluentd-daemonset.yaml
   - kube-state-metrics.yaml

@@ -1,0 +1,68 @@
+# Kibana refuses to start when configured with the "elastic" superuser
+# (config validation, not just a permissions issue) — it requires a scoped
+# account. Elasticsearch ships a built-in "kibana_system" user for exactly
+# this, but its password isn't settable via an env var like ELASTIC_PASSWORD
+# is for "elastic"; it has to be set through the security API. This Job does
+# that once, using the elastic superuser to authorize the change.
+#
+# One-time bootstrap: once it completes, re-running (e.g. after rotating
+# KIBANA_SYSTEM_PASSWORD in elastic-secret.yaml) requires deleting the Job
+# first, since a completed Job's spec is immutable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: elastic-bootstrap-kibana-user
+  namespace: monitoring
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: set-kibana-system-password
+          image: curlimages/curl:8.11.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: ELASTIC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: elastic-credentials
+                  key: ELASTIC_PASSWORD
+            - name: KIBANA_SYSTEM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: elastic-credentials
+                  key: KIBANA_SYSTEM_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              until curl -sf -u "elastic:${ELASTIC_PASSWORD}" \
+                  "http://elasticsearch.monitoring.svc.cluster.local:9200/_security/user/kibana_system" \
+                  -o /dev/null; do
+                echo "waiting for elasticsearch security api..."
+                sleep 10
+              done
+              curl -sf -u "elastic:${ELASTIC_PASSWORD}" \
+                -X POST "http://elasticsearch.monitoring.svc.cluster.local:9200/_security/user/kibana_system/_password" \
+                -H "Content-Type: application/json" \
+                -d "{\"password\":\"${KIBANA_SYSTEM_PASSWORD}\"}"
+              echo "kibana_system password set."
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
