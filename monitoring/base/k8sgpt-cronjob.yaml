@@ -88,9 +88,15 @@ spec:
               type: RuntimeDefault
           initContainers:
             - name: k8sgpt-analyze
-              # Not pinned to a specific version — verify/pin a real release
-              # tag before relying on this beyond initial testing.
-              image: ghcr.io/k8sgpt-ai/k8sgpt:latest
+              # The official k8sgpt image (ghcr.io/k8sgpt-ai/k8sgpt) has no
+              # shell at all ("sh: executable file not found") — found live
+              # when this first crashed with Init:StartError. Using plain
+              # alpine instead (ships sh/tar/wget via busybox, no `apk add`
+              # needed, so it works under a strict non-root securityContext)
+              # and downloading the k8sgpt binary at runtime. The
+              # releases/latest/download URL always resolves to whatever's
+              # newest — not pinned to a specific version.
+              image: alpine:3.20
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
@@ -109,8 +115,11 @@ spec:
                 - -c
                 - |
                   set -eu
-                  k8sgpt auth add --backend anthropic --model claude-3-5-sonnet-20241022 --password "$ANTHROPIC_API_KEY"
-                  k8sgpt analyze --explain --backend anthropic > /shared/result.txt 2>&1 || true
+                  wget -q -O /tmp/k8sgpt.tar.gz https://github.com/k8sgpt-ai/k8sgpt/releases/latest/download/k8sgpt_Linux_x86_64.tar.gz
+                  tar -xzf /tmp/k8sgpt.tar.gz -C /tmp
+                  chmod +x /tmp/k8sgpt
+                  /tmp/k8sgpt auth add --backend anthropic --model claude-3-5-sonnet-20241022 --password "$ANTHROPIC_API_KEY"
+                  /tmp/k8sgpt analyze --explain --backend anthropic > /shared/result.txt 2>&1 || true
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
