@@ -134,13 +134,20 @@ spec:
                   memory: 256Mi
           containers:
             - name: notify-discord
-              # Not curl+sed: hand-rolled shell JSON escaping (quotes,
-              # newlines) silently missed backslashes/control characters and
-              # produced invalid JSON — curl failed with exit 22 (HTTP error
-              # from Discord) on the very first real run. python's json.dumps
-              # handles escaping correctly; python:3.12-alpine needs no
-              # extra package installs (stdlib only), so it stays compatible
-              # with the strict non-root securityContext.
+              # History of two fixes, both found live:
+              # 1. Not curl+sed: hand-rolled shell JSON escaping missed
+              #    backslashes/control characters and produced invalid JSON
+              #    (curl exit 22). python's json.dumps escapes correctly.
+              # 2. Not python's urllib either: even with a spoofed
+              #    User-Agent header, Discord/Cloudflare returned 403 for
+              #    requests sent via urlopen — apparently a TLS-level
+              #    fingerprint check, not just the header. curl is the one
+              #    client proven to work against this webhook in this repo's
+              #    testing, but isn't installed here without apk (blocked by
+              #    the strict non-root securityContext); wget (via busybox,
+              #    already present, no install needed) is the next best bet.
+              #    So: python builds the JSON (correct escaping), wget sends
+              #    it (proven-workable transport).
               image: python:3.12-alpine
               securityContext:
                 allowPrivilegeEscalation: false
@@ -159,8 +166,8 @@ spec:
                 - |
                   import json
                   import os
+                  import subprocess
                   import sys
-                  import urllib.request
 
                   with open("/shared/result.txt") as f:
                       text = f.read()
@@ -172,21 +179,21 @@ spec:
                   body = text[:1800]
                   payload = json.dumps({
                       "content": "**k8sgpt cluster diagnostics**\n```\n" + body + "\n```"
-                  }).encode()
+                  })
 
-                  req = urllib.request.Request(
-                      os.environ["DISCORD_WEBHOOK_URL"],
-                      data=payload,
-                      # Discord/Cloudflare returns 403 for Python's default
-                      # "Python-urllib/3.x" User-Agent (found live) — this
-                      # exact webhook URL already works fine from curl.
-                      headers={
-                          "Content-Type": "application/json",
-                          "User-Agent": "curl/8.11.0",
-                      },
-                      method="POST",
+                  with open("/tmp/payload.json", "w") as f:
+                      f.write(payload)
+
+                  subprocess.run(
+                      [
+                          "wget", "-q", "-O", "-",
+                          "-U", "curl/8.11.0",
+                          "--header=Content-Type: application/json",
+                          "--post-file=/tmp/payload.json",
+                          os.environ["DISCORD_WEBHOOK_URL"],
+                      ],
+                      check=True,
                   )
-                  urllib.request.urlopen(req)
                   print("Posted to Discord.")
               volumeMounts:
                 - name: shared
