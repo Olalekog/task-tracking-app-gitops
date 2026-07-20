@@ -134,7 +134,14 @@ spec:
                   memory: 256Mi
           containers:
             - name: notify-discord
-              image: curlimages/curl:8.11.0
+              # Not curl+sed: hand-rolled shell JSON escaping (quotes,
+              # newlines) silently missed backslashes/control characters and
+              # produced invalid JSON — curl failed with exit 22 (HTTP error
+              # from Discord) on the very first real run. python's json.dumps
+              # handles escaping correctly; python:3.12-alpine needs no
+              # extra package installs (stdlib only), so it stays compatible
+              # with the strict non-root securityContext.
+              image: python:3.12-alpine
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
@@ -147,17 +154,34 @@ spec:
                       name: k8sgpt-secrets
                       key: DISCORD_WEBHOOK_URL
               command:
-                - sh
+                - python3
                 - -c
                 - |
-                  set -eu
-                  if [ ! -s /shared/result.txt ] || grep -qi "No problems detected" /shared/result.txt; then
-                    echo "No issues found, nothing to post."
-                    exit 0
-                  fi
-                  BODY=$(head -c 1800 /shared/result.txt)
-                  PAYLOAD=$(printf '{"content":"**k8sgpt cluster diagnostics**\\n```\\n%s\\n```"}' "$(echo "$BODY" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')")
-                  curl -sf -X POST "$DISCORD_WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD"
+                  import json
+                  import os
+                  import sys
+                  import urllib.request
+
+                  with open("/shared/result.txt") as f:
+                      text = f.read()
+
+                  if not text.strip() or "no problems detected" in text.lower():
+                      print("No issues found, nothing to post.")
+                      sys.exit(0)
+
+                  body = text[:1800]
+                  payload = json.dumps({
+                      "content": "**k8sgpt cluster diagnostics**\n```\n" + body + "\n```"
+                  }).encode()
+
+                  req = urllib.request.Request(
+                      os.environ["DISCORD_WEBHOOK_URL"],
+                      data=payload,
+                      headers={"Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  urllib.request.urlopen(req)
+                  print("Posted to Discord.")
               volumeMounts:
                 - name: shared
                   mountPath: /shared
